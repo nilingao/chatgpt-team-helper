@@ -1,0 +1,2578 @@
+import express from 'express'
+import { getDatabase, saveDatabase } from '../database/init.js'
+import { authenticateToken } from '../middleware/auth.js'
+import { requireSuperAdmin } from '../middleware/rbac.js'
+import { buildMenuTree, listMenus } from '../services/rbac.js'
+import { parseDomainWhitelist, getEmailDomainWhitelistFromEnv } from '../utils/email-domain-whitelist.js'
+import { getPointsWithdrawSettings } from '../utils/points-withdraw-settings.js'
+import { listUserPointsLedger, safeInsertPointsLedgerEntry } from '../utils/points-ledger.js'
+import { upsertSystemConfigValue } from '../utils/system-config.js'
+import { getSmtpSettings, getSmtpSettingsFromEnv, invalidateSmtpSettingsCache, parseBool } from '../utils/smtp-settings.js'
+import {
+  getLinuxDoOAuthSettings,
+  getLinuxDoOAuthSettingsFromEnv,
+  getLinuxDoCreditSettings,
+  getLinuxDoCreditSettingsFromEnv,
+  invalidateLinuxDoSettingsCache
+} from '../utils/linuxdo-settings.js'
+import { getZpaySettings, getZpaySettingsFromEnv, invalidateZpaySettingsCache } from '../utils/zpay-settings.js'
+import { getTurnstileSettings, getTurnstileSettingsFromEnv, invalidateTurnstileSettingsCache } from '../utils/turnstile-settings.js'
+import { getTelegramSettings, getTelegramSettingsFromEnv, invalidateTelegramSettingsCache } from '../utils/telegram-settings.js'
+import { getFeatureFlags, invalidateFeatureFlagsCache } from '../utils/feature-flags.js'
+import { withLocks } from '../utils/locks.js'
+import { redeemCodeInternal } from './redemption-codes.js'
+
+const router = express.Router()
+
+router.use(authenticateToken, requireSuperAdmin)
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+const normalizeEmail = (value) => String(value ?? '').trim().toLowerCase()
+const extractEmailFromRedeemedBy = (redeemedBy) => {
+  const raw = String(redeemedBy ?? '').trim()
+  if (!raw) return ''
+
+  const match = raw.match(/email\s*:\s*([^|]+)(?:\||$)/i)
+  if (match?.[1]) {
+    return normalizeEmail(match[1])
+  }
+
+  const normalized = normalizeEmail(raw)
+  return EMAIL_REGEX.test(normalized) ? normalized : ''
+}
+
+const normalizeAdminMenuPath = (value) => {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+
+  if (raw.startsWith('/')) {
+    if (raw === '/admin' || raw.startsWith('/admin/')) return raw
+    return null
+  }
+
+  let relative = raw
+  if (relative.startsWith('admin/')) relative = relative.slice('admin/'.length)
+  if (relative.startsWith('./')) relative = relative.slice(2)
+  relative = relative.replace(/^\/+/, '')
+  if (!relative) return '/admin'
+  return `/admin/${relative}`
+}
+
+const toInt = (value, fallback) => {
+  const parsed = Number.parseInt(String(value ?? ''), 10)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+const ORDER_TYPE_WARRANTY = 'warranty'
+const ORDER_TYPE_NO_WARRANTY = 'no_warranty'
+const ORDER_TYPE_ANTI_BAN = 'anti_ban'
+const ORDER_TYPE_SET = new Set([ORDER_TYPE_WARRANTY, ORDER_TYPE_NO_WARRANTY, ORDER_TYPE_ANTI_BAN])
+
+const normalizeOrderType = (value) => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return ORDER_TYPE_SET.has(normalized) ? normalized : ORDER_TYPE_WARRANTY
+}
+
+const ACCOUNT_RECOVERY_WINDOW_DAYS = Math.max(1, toInt(process.env.ACCOUNT_RECOVERY_WINDOW_DAYS, 30))
+
+const recordAccountRecovery = (db, payload) => {
+  if (!db || !payload) return
+  db.run(
+    `
+      INSERT INTO account_recovery_logs (
+        email,
+        original_code_id,
+        original_redeemed_at,
+        original_account_email,
+        recovery_mode,
+        recovery_code_id,
+        recovery_code,
+        recovery_account_email,
+        status,
+        error_message,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+    `,
+    [
+      payload.email,
+      payload.originalCodeId,
+      payload.originalRedeemedAt || null,
+      payload.originalAccountEmail || null,
+      payload.recoveryMode || null,
+      payload.recoveryCodeId || null,
+      payload.recoveryCode || null,
+      payload.recoveryAccountEmail || null,
+      payload.status || 'pending',
+      payload.errorMessage || null,
+    ]
+  )
+}
+
+const getUserWithRoles = (db, userId) => {
+  const userResult = db.exec(
+    `
+      SELECT id, username, email, created_at, invite_code, invited_by_user_id, COALESCE(invite_enabled, 1), COALESCE(points, 0)
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [userId]
+  )
+  const row = userResult[0]?.values?.[0]
+  if (!row) return null
+
+  const rolesResult = db.exec(
+    `
+      SELECT r.role_key, r.role_name
+      FROM user_roles ur
+      JOIN roles r ON r.id = ur.role_id
+      WHERE ur.user_id = ?
+      ORDER BY r.id ASC
+    `,
+    [userId]
+  )
+  const roles = (rolesResult[0]?.values || []).map(r => ({
+    roleKey: r[0],
+    roleName: r[1]
+  }))
+
+  const invitedCountResult = db.exec(
+    'SELECT COUNT(*) FROM users WHERE invited_by_user_id = ?',
+    [row[0]]
+  )
+  const invitedCount = Number(invitedCountResult[0]?.values?.[0]?.[0] || 0)
+
+  const orderCountResult = db.exec(
+    'SELECT COUNT(*) FROM purchase_orders WHERE user_id = ?',
+    [row[0]]
+  )
+  const orderCount = Number(orderCountResult[0]?.values?.[0]?.[0] || 0)
+
+  return {
+    id: row[0],
+    username: row[1],
+    email: row[2],
+    createdAt: row[3],
+    inviteCode: row[4] || null,
+    invitedByUserId: row[5] || null,
+    inviteEnabled: Number(row[6] ?? 1) !== 0,
+    points: Number(row[7] || 0),
+    invitedCount,
+    orderCount,
+    roles
+  }
+}
+
+router.get('/email-domain-whitelist', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const result = db.exec('SELECT config_value FROM system_config WHERE config_key = ? LIMIT 1', ['email_domain_whitelist'])
+    const stored = result[0]?.values?.length ? String(result[0].values[0][0] || '') : ''
+    const domains = stored ? parseDomainWhitelist(stored) : getEmailDomainWhitelistFromEnv()
+    res.json({ domains })
+  } catch (error) {
+    console.error('Get email-domain-whitelist error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/email-domain-whitelist', async (req, res) => {
+  try {
+    const domains = parseDomainWhitelist(req.body?.domains ?? req.body?.value)
+    const db = await getDatabase()
+
+    const configValue = domains.join(',')
+    const existing = db.exec('SELECT id FROM system_config WHERE config_key = ? LIMIT 1', ['email_domain_whitelist'])
+
+    if (existing[0]?.values?.length) {
+      db.run(
+        `UPDATE system_config SET config_value = ?, updated_at = DATETIME('now', 'localtime') WHERE config_key = ?`,
+        [configValue, 'email_domain_whitelist']
+      )
+    } else {
+      db.run(
+        `INSERT INTO system_config (config_key, config_value, updated_at) VALUES (?, ?, DATETIME('now', 'localtime'))`,
+        ['email_domain_whitelist', configValue]
+      )
+    }
+
+    saveDatabase()
+    res.json({ domains })
+  } catch (error) {
+    console.error('Update email-domain-whitelist error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/points-withdraw-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getPointsWithdrawSettings(db)
+    res.json({
+      rate: {
+        points: settings.ratePoints,
+        cashCents: settings.rateCashCents,
+      },
+      minCashCents: settings.minCashCents,
+      minPoints: settings.minPoints,
+      stepPoints: settings.stepPoints,
+    })
+  } catch (error) {
+    console.error('Get points-withdraw-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/points-withdraw-settings', async (req, res) => {
+  try {
+    const ratePointsRaw = req.body?.rate?.points ?? req.body?.ratePoints
+    const rateCashCentsRaw = req.body?.rate?.cashCents ?? req.body?.rateCashCents
+    const minCashCentsRaw = req.body?.minCashCents
+
+    const ratePoints = Number.parseInt(String(ratePointsRaw ?? ''), 10)
+    const rateCashCents = Number.parseInt(String(rateCashCentsRaw ?? ''), 10)
+    const minCashCents = Number.parseInt(String(minCashCentsRaw ?? ''), 10)
+
+    if (!Number.isFinite(ratePoints) || ratePoints <= 0) {
+      return res.status(400).json({ error: 'Invalid ratePoints' })
+    }
+    if (!Number.isFinite(rateCashCents) || rateCashCents <= 0) {
+      return res.status(400).json({ error: 'Invalid rateCashCents' })
+    }
+    if (!Number.isFinite(minCashCents) || minCashCents < 0) {
+      return res.status(400).json({ error: 'Invalid minCashCents' })
+    }
+
+    const db = await getDatabase()
+    upsertSystemConfigValue(db, 'points_withdraw_rate_points', String(ratePoints))
+    upsertSystemConfigValue(db, 'points_withdraw_rate_cash_cents', String(rateCashCents))
+    upsertSystemConfigValue(db, 'points_withdraw_min_cash_cents', String(minCashCents))
+    saveDatabase()
+
+    const settings = await getPointsWithdrawSettings(db)
+    res.json({
+      rate: {
+        points: settings.ratePoints,
+        cashCents: settings.rateCashCents,
+      },
+      minCashCents: settings.minCashCents,
+      minPoints: settings.minPoints,
+      stepPoints: settings.stepPoints,
+    })
+  } catch (error) {
+    console.error('Update points-withdraw-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/feature-flags', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const features = await getFeatureFlags(db, { forceRefresh: true })
+    res.json({ features })
+  } catch (error) {
+    console.error('Get feature-flags error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/feature-flags', async (req, res) => {
+  try {
+    const payload = req.body?.features && typeof req.body.features === 'object' ? req.body.features : (req.body || {})
+
+    const normalizeFlag = (value) => {
+      if (typeof value === 'boolean') return value
+      if (typeof value === 'number') return value !== 0
+      const normalized = String(value ?? '').trim().toLowerCase()
+      if (!normalized) return null
+      if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true
+      if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false
+      return null
+    }
+
+    const nextFlags = {}
+    const keys = ['xhs', 'xianyu', 'payment', 'openAccounts']
+    for (const key of keys) {
+      if (!(key in payload)) continue
+      const value = normalizeFlag(payload?.[key])
+      if (value === null) {
+        return res.status(400).json({ error: `Invalid feature flag: ${key}` })
+      }
+      nextFlags[key] = value
+    }
+
+    if (!Object.keys(nextFlags).length) {
+      return res.status(400).json({ error: 'No feature flags provided' })
+    }
+
+    const db = await getDatabase()
+
+    if ('xhs' in nextFlags) upsertSystemConfigValue(db, 'feature_xhs_enabled', nextFlags.xhs ? 'true' : 'false')
+    if ('xianyu' in nextFlags) upsertSystemConfigValue(db, 'feature_xianyu_enabled', nextFlags.xianyu ? 'true' : 'false')
+    if ('payment' in nextFlags) upsertSystemConfigValue(db, 'feature_payment_enabled', nextFlags.payment ? 'true' : 'false')
+    if ('openAccounts' in nextFlags) upsertSystemConfigValue(db, 'feature_open_accounts_enabled', nextFlags.openAccounts ? 'true' : 'false')
+
+    saveDatabase()
+    invalidateFeatureFlagsCache()
+
+    const features = await getFeatureFlags(db, { forceRefresh: true })
+    res.json({ features })
+  } catch (error) {
+    console.error('Update feature-flags error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/smtp-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getSmtpSettings(db, { forceRefresh: true })
+    const smtp = settings.smtp || {}
+
+    res.json({
+      smtp: {
+        host: String(smtp.host || ''),
+        port: Number(smtp.port || 0) || 0,
+        secure: Boolean(smtp.secure),
+        user: String(smtp.user || ''),
+        from: String(smtp.from || ''),
+        passSet: Boolean(String(smtp.pass || '').trim()),
+        passStored: Boolean(settings.stored?.smtpPass)
+      },
+      adminAlertEmail: String(settings.adminAlertEmail || '')
+    })
+  } catch (error) {
+    console.error('Get smtp-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/smtp-settings', async (req, res) => {
+  try {
+    const smtpPayload = req.body?.smtp && typeof req.body.smtp === 'object' ? req.body.smtp : {}
+    const recipientsRaw = req.body?.adminAlertEmail ?? req.body?.recipients ?? ''
+
+    const db = await getDatabase()
+    const current = await getSmtpSettings(db, { forceRefresh: true })
+    const env = getSmtpSettingsFromEnv()
+
+    const host = String(smtpPayload.host ?? current.smtp.host ?? '').trim()
+
+    const rawPort = smtpPayload.port ?? current.smtp.port
+    const port = Number.parseInt(String(rawPort ?? ''), 10)
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+      return res.status(400).json({ error: 'Invalid smtp port' })
+    }
+
+    const secureRaw = smtpPayload.secure ?? current.smtp.secure
+    const secure = typeof secureRaw === 'boolean' ? secureRaw : parseBool(secureRaw, true)
+
+    const user = String(smtpPayload.user ?? current.smtp.user ?? '').trim()
+
+    const passInput = smtpPayload.pass
+    const providedPass = typeof passInput === 'string' ? passInput.trim() : ''
+
+    let pass = current.smtp.pass || ''
+    let shouldUpsertPass = false
+    if (providedPass) {
+      pass = providedPass
+      shouldUpsertPass = true
+    } else if (!current.stored?.smtpPass) {
+      const envPass = String(env.smtp.pass || '').trim()
+      if (envPass && host && user) {
+        pass = envPass
+        shouldUpsertPass = true
+      }
+    }
+
+    const wantsEnable = Boolean(host || user || providedPass)
+    if (wantsEnable) {
+      if (!host) return res.status(400).json({ error: 'SMTP host is required' })
+      if (!user) return res.status(400).json({ error: 'SMTP user is required' })
+      if (!String(pass || '').trim()) return res.status(400).json({ error: 'SMTP password is required' })
+    }
+
+    const from = String(smtpPayload.from ?? current.smtp.from ?? '').trim()
+    const adminAlertEmail = String(recipientsRaw ?? current.adminAlertEmail ?? '').trim()
+
+    upsertSystemConfigValue(db, 'smtp_host', host)
+    upsertSystemConfigValue(db, 'smtp_port', String(port))
+    upsertSystemConfigValue(db, 'smtp_secure', secure ? 'true' : 'false')
+    upsertSystemConfigValue(db, 'smtp_user', user)
+    if (shouldUpsertPass) {
+      upsertSystemConfigValue(db, 'smtp_pass', pass)
+    }
+    upsertSystemConfigValue(db, 'smtp_from', from)
+    upsertSystemConfigValue(db, 'admin_alert_email', adminAlertEmail)
+    saveDatabase()
+    invalidateSmtpSettingsCache()
+
+    const updated = await getSmtpSettings(db, { forceRefresh: true })
+    const smtp = updated.smtp || {}
+
+    res.json({
+      smtp: {
+        host: String(smtp.host || ''),
+        port: Number(smtp.port || 0) || 0,
+        secure: Boolean(smtp.secure),
+        user: String(smtp.user || ''),
+        from: String(smtp.from || ''),
+        passSet: Boolean(String(smtp.pass || '').trim()),
+        passStored: Boolean(updated.stored?.smtpPass)
+      },
+      adminAlertEmail: String(updated.adminAlertEmail || '')
+    })
+  } catch (error) {
+    console.error('Update smtp-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/linuxdo-oauth-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getLinuxDoOAuthSettings(db, { forceRefresh: true })
+
+    res.json({
+      oauth: {
+        clientId: String(settings.clientId || ''),
+        redirectUri: String(settings.redirectUri || ''),
+        clientIdStored: Boolean(settings.stored?.clientId),
+        redirectUriStored: Boolean(settings.stored?.redirectUri),
+        clientSecretSet: Boolean(String(settings.clientSecret || '').trim()),
+        clientSecretStored: Boolean(settings.stored?.clientSecret)
+      }
+    })
+  } catch (error) {
+    console.error('Get linuxdo-oauth-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/linuxdo-oauth-settings', async (req, res) => {
+  try {
+    const payload = req.body?.oauth && typeof req.body.oauth === 'object' ? req.body.oauth : (req.body || {})
+    const db = await getDatabase()
+
+    const current = await getLinuxDoOAuthSettings(db, { forceRefresh: true })
+    const env = getLinuxDoOAuthSettingsFromEnv()
+
+    const clientId = String(payload.clientId ?? current.clientId ?? '').trim()
+    const redirectUri = String(payload.redirectUri ?? current.redirectUri ?? '').trim()
+
+    const secretInput = typeof payload.clientSecret === 'string' ? payload.clientSecret.trim() : ''
+    let clientSecret = current.clientSecret || ''
+    let shouldUpsertSecret = false
+
+    if (secretInput) {
+      clientSecret = secretInput
+      shouldUpsertSecret = true
+    } else if (!current.stored?.clientSecret) {
+      const envSecret = String(env.clientSecret || '').trim()
+      if (envSecret && clientId) {
+        clientSecret = envSecret
+        shouldUpsertSecret = true
+      }
+    }
+
+    const wantsEnable = Boolean(clientId || redirectUri || secretInput)
+    if (wantsEnable) {
+      if (!clientId) return res.status(400).json({ error: 'Linux DO clientId is required' })
+      if (!redirectUri) return res.status(400).json({ error: 'Linux DO redirectUri is required' })
+      if (!String(clientSecret || '').trim()) return res.status(400).json({ error: 'Linux DO clientSecret is required' })
+
+      try {
+        const parsed = new URL(redirectUri)
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+          return res.status(400).json({ error: 'Linux DO redirectUri must be http(s)' })
+        }
+      } catch {
+        return res.status(400).json({ error: 'Linux DO redirectUri is invalid' })
+      }
+    }
+
+    upsertSystemConfigValue(db, 'linuxdo_client_id', clientId)
+    upsertSystemConfigValue(db, 'linuxdo_redirect_uri', redirectUri)
+    if (shouldUpsertSecret) {
+      upsertSystemConfigValue(db, 'linuxdo_client_secret', clientSecret)
+    }
+
+    saveDatabase()
+    invalidateLinuxDoSettingsCache()
+
+    const updated = await getLinuxDoOAuthSettings(db, { forceRefresh: true })
+    res.json({
+      oauth: {
+        clientId: String(updated.clientId || ''),
+        redirectUri: String(updated.redirectUri || ''),
+        clientIdStored: Boolean(updated.stored?.clientId),
+        redirectUriStored: Boolean(updated.stored?.redirectUri),
+        clientSecretSet: Boolean(String(updated.clientSecret || '').trim()),
+        clientSecretStored: Boolean(updated.stored?.clientSecret)
+      }
+    })
+  } catch (error) {
+    console.error('Update linuxdo-oauth-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/linuxdo-credit-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getLinuxDoCreditSettings(db, { forceRefresh: true })
+
+    res.json({
+      credit: {
+        pid: String(settings.pid || ''),
+        pidStored: Boolean(settings.stored?.pid),
+        keySet: Boolean(String(settings.key || '').trim()),
+        keyStored: Boolean(settings.stored?.key)
+      }
+    })
+  } catch (error) {
+    console.error('Get linuxdo-credit-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/linuxdo-credit-settings', async (req, res) => {
+  try {
+    const payload = req.body?.credit && typeof req.body.credit === 'object' ? req.body.credit : (req.body || {})
+    const db = await getDatabase()
+
+    const current = await getLinuxDoCreditSettings(db, { forceRefresh: true })
+    const env = getLinuxDoCreditSettingsFromEnv()
+
+    const pid = String(payload.pid ?? current.pid ?? '').trim()
+
+    const keyInput = typeof payload.key === 'string' ? payload.key.trim() : ''
+    let key = current.key || ''
+    let shouldUpsertKey = false
+
+    if (keyInput) {
+      key = keyInput
+      shouldUpsertKey = true
+    } else if (!current.stored?.key) {
+      const envKey = String(env.key || '').trim()
+      if (envKey && pid) {
+        key = envKey
+        shouldUpsertKey = true
+      }
+    }
+
+    const wantsEnable = Boolean(pid || keyInput)
+    if (wantsEnable) {
+      if (!pid) return res.status(400).json({ error: 'Credit pid is required' })
+      if (!String(key || '').trim()) return res.status(400).json({ error: 'Credit key is required' })
+    }
+
+    upsertSystemConfigValue(db, 'linuxdo_credit_pid', pid)
+    if (shouldUpsertKey) {
+      upsertSystemConfigValue(db, 'linuxdo_credit_key', key)
+    }
+
+    saveDatabase()
+    invalidateLinuxDoSettingsCache()
+
+    const updated = await getLinuxDoCreditSettings(db, { forceRefresh: true })
+    res.json({
+      credit: {
+        pid: String(updated.pid || ''),
+        pidStored: Boolean(updated.stored?.pid),
+        keySet: Boolean(String(updated.key || '').trim()),
+        keyStored: Boolean(updated.stored?.key)
+      }
+    })
+  } catch (error) {
+    console.error('Update linuxdo-credit-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/zpay-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getZpaySettings(db, { forceRefresh: true })
+
+    res.json({
+      zpay: {
+        baseUrl: String(settings.baseUrl || ''),
+        pid: String(settings.pid || ''),
+        baseUrlStored: Boolean(settings.stored?.baseUrl),
+        pidStored: Boolean(settings.stored?.pid),
+        keySet: Boolean(String(settings.key || '').trim()),
+        keyStored: Boolean(settings.stored?.key)
+      }
+    })
+  } catch (error) {
+    console.error('Get zpay-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/zpay-settings', async (req, res) => {
+  try {
+    const payload = req.body?.zpay && typeof req.body.zpay === 'object' ? req.body.zpay : (req.body || {})
+    const db = await getDatabase()
+
+    const current = await getZpaySettings(db, { forceRefresh: true })
+    const env = getZpaySettingsFromEnv()
+
+    const baseUrlRaw = String(payload.baseUrl ?? current.baseUrl ?? '').trim()
+    let baseUrl = baseUrlRaw
+    if (baseUrl) {
+      try {
+        const parsed = new URL(baseUrl)
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+          return res.status(400).json({ error: 'ZPAY baseUrl must be http(s)' })
+        }
+      } catch {
+        return res.status(400).json({ error: 'ZPAY baseUrl is invalid' })
+      }
+      baseUrl = baseUrl.replace(/\/+$/, '')
+    }
+
+    const pid = String(payload.pid ?? current.pid ?? '').trim()
+
+    const keyInput = typeof payload.key === 'string' ? payload.key.trim() : ''
+    let key = String(current.key || '').trim()
+    let shouldUpsertKey = false
+
+    if (keyInput) {
+      key = keyInput
+      shouldUpsertKey = true
+    } else if (!current.stored?.key) {
+      const envKey = String(env.key || '').trim()
+      if (envKey && pid) {
+        key = envKey
+        shouldUpsertKey = true
+      }
+    }
+
+    if (pid) {
+      if (!key) return res.status(400).json({ error: 'ZPAY key is required' })
+    }
+
+    upsertSystemConfigValue(db, 'zpay_base_url', baseUrl)
+    upsertSystemConfigValue(db, 'zpay_pid', pid)
+    if (shouldUpsertKey) {
+      upsertSystemConfigValue(db, 'zpay_key', key)
+    }
+
+    saveDatabase()
+    invalidateZpaySettingsCache()
+
+    const updated = await getZpaySettings(db, { forceRefresh: true })
+    res.json({
+      zpay: {
+        baseUrl: String(updated.baseUrl || ''),
+        pid: String(updated.pid || ''),
+        baseUrlStored: Boolean(updated.stored?.baseUrl),
+        pidStored: Boolean(updated.stored?.pid),
+        keySet: Boolean(String(updated.key || '').trim()),
+        keyStored: Boolean(updated.stored?.key)
+      }
+    })
+  } catch (error) {
+    console.error('Update zpay-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/turnstile-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getTurnstileSettings(db, { forceRefresh: true })
+
+    res.json({
+      turnstile: {
+        siteKey: String(settings.siteKey || ''),
+        siteKeyStored: Boolean(settings.stored?.siteKey),
+        secretSet: Boolean(String(settings.secretKey || '').trim()),
+        secretStored: Boolean(settings.stored?.secretKey)
+      },
+      enabled: Boolean(settings.enabled)
+    })
+  } catch (error) {
+    console.error('Get turnstile-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/turnstile-settings', async (req, res) => {
+  try {
+    const payload = req.body?.turnstile && typeof req.body.turnstile === 'object' ? req.body.turnstile : (req.body || {})
+    const db = await getDatabase()
+
+    const current = await getTurnstileSettings(db, { forceRefresh: true })
+    const env = getTurnstileSettingsFromEnv()
+
+    const siteKey = String(payload.siteKey ?? current.siteKey ?? '').trim()
+
+    const secretInput = typeof payload.secretKey === 'string' ? payload.secretKey.trim() : ''
+    let secretKey = String(current.secretKey || '').trim()
+    let shouldUpsertSecret = false
+
+    if (secretInput) {
+      secretKey = secretInput
+      shouldUpsertSecret = true
+    } else if (!current.stored?.secretKey) {
+      const envSecret = String(env.secretKey || '').trim()
+      if (envSecret && siteKey) {
+        secretKey = envSecret
+        shouldUpsertSecret = true
+      }
+    }
+
+    upsertSystemConfigValue(db, 'turnstile_site_key', siteKey)
+    if (shouldUpsertSecret) {
+      upsertSystemConfigValue(db, 'turnstile_secret_key', secretKey)
+    }
+
+    saveDatabase()
+    invalidateTurnstileSettingsCache()
+
+    const updated = await getTurnstileSettings(db, { forceRefresh: true })
+
+    res.json({
+      turnstile: {
+        siteKey: String(updated.siteKey || ''),
+        siteKeyStored: Boolean(updated.stored?.siteKey),
+        secretSet: Boolean(String(updated.secretKey || '').trim()),
+        secretStored: Boolean(updated.stored?.secretKey)
+      },
+      enabled: Boolean(updated.enabled)
+    })
+  } catch (error) {
+    console.error('Update turnstile-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/telegram-settings', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const settings = await getTelegramSettings(db, { forceRefresh: true })
+
+    res.json({
+      telegram: {
+        allowedUserIds: String(settings.allowedUserIds || ''),
+        allowedUserIdsStored: Boolean(settings.stored?.allowedUserIds),
+        notifyEnabled: Boolean(settings.notifyEnabled),
+        notifyEnabledStored: Boolean(settings.stored?.notifyEnabled),
+        notifyChatIds: String(settings.notifyChatIds || ''),
+        notifyChatIdsStored: Boolean(settings.stored?.notifyChatIds),
+        notifyTimeoutMs: Number(settings.notifyTimeoutMs || 0) || 0,
+        notifyTimeoutMsStored: Boolean(settings.stored?.notifyTimeoutMs),
+        tokenSet: Boolean(String(settings.token || '').trim()),
+        tokenStored: Boolean(settings.stored?.token)
+      }
+    })
+  } catch (error) {
+    console.error('Get telegram-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/telegram-settings', async (req, res) => {
+  try {
+    const payload = req.body?.telegram && typeof req.body.telegram === 'object' ? req.body.telegram : (req.body || {})
+    const db = await getDatabase()
+
+    const current = await getTelegramSettings(db, { forceRefresh: true })
+    const env = getTelegramSettingsFromEnv()
+
+    const allowedUserIds = String(payload.allowedUserIds ?? current.allowedUserIds ?? '').trim()
+
+    const tokenInput =
+      typeof payload.botToken === 'string'
+        ? payload.botToken.trim()
+        : (typeof payload.token === 'string' ? payload.token.trim() : '')
+
+    let token = String(current.token || '').trim()
+    let shouldUpsertToken = false
+
+    if (tokenInput) {
+      token = tokenInput
+      shouldUpsertToken = true
+    } else if (!current.stored?.token) {
+      const envToken = String(env.token || '').trim()
+      if (envToken) {
+        token = envToken
+        shouldUpsertToken = true
+      }
+    }
+
+    const notifyEnabledInput = payload.notifyEnabled ?? payload.notify_enabled ?? payload?.notify?.enabled
+    let notifyEnabled = Boolean(current.notifyEnabled)
+    let shouldUpsertNotifyEnabled = false
+    if (notifyEnabledInput !== undefined) {
+      notifyEnabled = typeof notifyEnabledInput === 'boolean'
+        ? notifyEnabledInput
+        : parseBool(notifyEnabledInput, notifyEnabled)
+      shouldUpsertNotifyEnabled = true
+    }
+
+    const notifyChatIdsInput = payload.notifyChatIds ?? payload.notify_chat_ids ?? payload?.notify?.chatIds ?? payload?.notify?.chat_ids
+    const notifyChatIds = notifyChatIdsInput !== undefined ? String(notifyChatIdsInput ?? '').trim() : ''
+    const shouldUpsertNotifyChatIds = notifyChatIdsInput !== undefined
+
+    const notifyTimeoutMsInput = payload.notifyTimeoutMs ?? payload.notify_timeout_ms ?? payload?.notify?.timeoutMs ?? payload?.notify?.timeout_ms
+    let notifyTimeoutMs = Number(current.notifyTimeoutMs || 0) || 0
+    let shouldUpsertNotifyTimeoutMs = false
+    if (notifyTimeoutMsInput !== undefined) {
+      const parsed = toInt(notifyTimeoutMsInput, Number(env.notifyTimeoutMs || 0) || 8000)
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return res.status(400).json({ error: 'Invalid telegram notify timeout' })
+      }
+      notifyTimeoutMs = Math.min(120000, Math.max(1000, parsed))
+      shouldUpsertNotifyTimeoutMs = true
+    }
+
+    upsertSystemConfigValue(db, 'telegram_allowed_user_ids', allowedUserIds)
+    if (shouldUpsertNotifyEnabled) {
+      upsertSystemConfigValue(db, 'telegram_notify_enabled', notifyEnabled ? 'true' : 'false')
+    }
+    if (shouldUpsertNotifyChatIds) {
+      upsertSystemConfigValue(db, 'telegram_notify_chat_ids', notifyChatIds)
+    }
+    if (shouldUpsertNotifyTimeoutMs) {
+      upsertSystemConfigValue(db, 'telegram_notify_timeout_ms', String(notifyTimeoutMs))
+    }
+    if (shouldUpsertToken) {
+      upsertSystemConfigValue(db, 'telegram_bot_token', token)
+    }
+
+    saveDatabase()
+    invalidateTelegramSettingsCache()
+
+    const updated = await getTelegramSettings(db, { forceRefresh: true })
+
+    res.json({
+      telegram: {
+        allowedUserIds: String(updated.allowedUserIds || ''),
+        allowedUserIdsStored: Boolean(updated.stored?.allowedUserIds),
+        notifyEnabled: Boolean(updated.notifyEnabled),
+        notifyEnabledStored: Boolean(updated.stored?.notifyEnabled),
+        notifyChatIds: String(updated.notifyChatIds || ''),
+        notifyChatIdsStored: Boolean(updated.stored?.notifyChatIds),
+        notifyTimeoutMs: Number(updated.notifyTimeoutMs || 0) || 0,
+        notifyTimeoutMsStored: Boolean(updated.stored?.notifyTimeoutMs),
+        tokenSet: Boolean(String(updated.token || '').trim()),
+        tokenStored: Boolean(updated.stored?.token)
+      }
+    })
+  } catch (error) {
+    console.error('Update telegram-settings error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/rbac/menus', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const menus = await listMenus(db, { includeInactive: true })
+    res.json({ menus, tree: buildMenuTree(menus) })
+  } catch (error) {
+    console.error('Get menus error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/rbac/menus', async (req, res) => {
+  try {
+    const menuKey = String(req.body?.menuKey || '').trim()
+    const label = String(req.body?.label || '').trim()
+    const pathInput = req.body?.path
+    const parentIdRaw = req.body?.parentId
+    const sortOrder = toInt(req.body?.sortOrder, 0)
+    const isActive = Boolean(req.body?.isActive ?? true)
+
+    if (!/^[a-z][a-z0-9_]{2,63}$/.test(menuKey)) {
+      return res.status(400).json({ error: 'Invalid menuKey' })
+    }
+    if (!label) {
+      return res.status(400).json({ error: 'label is required' })
+    }
+
+    const normalizedPath = normalizeAdminMenuPath(pathInput)
+    if (normalizedPath === null) {
+      return res.status(400).json({ error: 'Invalid path. Only /admin paths or relative paths are allowed.' })
+    }
+
+    const parentId = Number.isFinite(Number(parentIdRaw)) && Number(parentIdRaw) > 0 ? Number(parentIdRaw) : null
+
+    const db = await getDatabase()
+    const existing = db.exec('SELECT id FROM menus WHERE menu_key = ? LIMIT 1', [menuKey])
+    if (existing[0]?.values?.length) {
+      return res.status(409).json({ error: 'Menu already exists' })
+    }
+
+    if (parentId) {
+      const parent = db.exec(
+        `
+          SELECT id, parent_id
+          FROM menus
+          WHERE id = ?
+          LIMIT 1
+        `,
+        [parentId]
+      )
+      if (!parent[0]?.values?.length) {
+        return res.status(400).json({ error: 'Invalid parentId' })
+      }
+      const parentParentId = parent[0].values[0][1]
+      if (parentParentId != null) {
+        return res.status(400).json({ error: '父菜单必须是一级菜单（系统仅支持两级菜单）' })
+      }
+    }
+
+    db.run(
+      `
+        INSERT INTO menus (menu_key, label, path, parent_id, sort_order, is_active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+      `,
+      [menuKey, label, normalizedPath, parentId, sortOrder, isActive ? 1 : 0]
+    )
+
+    const created = db.exec('SELECT id FROM menus WHERE menu_key = ? LIMIT 1', [menuKey])
+    const menuId = created[0]?.values?.length ? Number(created[0].values[0][0]) : null
+
+    if (menuId) {
+      const superRole = db.exec('SELECT id FROM roles WHERE role_key = ? LIMIT 1', ['super_admin'])
+      const superRoleId = superRole[0]?.values?.length ? Number(superRole[0].values[0][0]) : null
+      if (superRoleId) {
+        db.run(
+          'INSERT OR IGNORE INTO role_menus (role_id, menu_id) VALUES (?, ?)',
+          [superRoleId, menuId]
+        )
+      }
+    }
+
+    saveDatabase()
+    res.json({
+      menu: {
+        id: menuId,
+        menuKey,
+        label,
+        path: normalizedPath,
+        parentId,
+        sortOrder,
+        isActive,
+      }
+    })
+  } catch (error) {
+    console.error('Create menu error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/rbac/menus/:id', async (req, res) => {
+  try {
+    const menuId = Number(req.params.id)
+    if (!Number.isFinite(menuId) || menuId <= 0) {
+      return res.status(400).json({ error: 'Invalid menu id' })
+    }
+
+    const label = String(req.body?.label || '').trim()
+    const pathInput = req.body?.path
+    const parentIdRaw = req.body?.parentId
+    const sortOrder = toInt(req.body?.sortOrder, 0)
+    const isActive = Boolean(req.body?.isActive ?? true)
+
+    if (!label) {
+      return res.status(400).json({ error: 'label is required' })
+    }
+
+    const normalizedPath = normalizeAdminMenuPath(pathInput)
+    if (normalizedPath === null) {
+      return res.status(400).json({ error: 'Invalid path. Only /admin paths or relative paths are allowed.' })
+    }
+
+    const parentId = Number.isFinite(Number(parentIdRaw)) && Number(parentIdRaw) > 0 ? Number(parentIdRaw) : null
+
+    const db = await getDatabase()
+    const existing = db.exec(
+      `
+        SELECT id, menu_key, parent_id
+        FROM menus
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [menuId]
+    )
+    if (!existing[0]?.values?.length) {
+      return res.status(404).json({ error: 'Menu not found' })
+    }
+    const existingMenuKey = String(existing[0].values[0][1] || '')
+
+    if (parentId && parentId === menuId) {
+      return res.status(400).json({ error: 'Invalid parentId' })
+    }
+
+    if (parentId) {
+      const parent = db.exec(
+        `
+          SELECT id, parent_id
+          FROM menus
+          WHERE id = ?
+          LIMIT 1
+        `,
+        [parentId]
+      )
+      if (!parent[0]?.values?.length) {
+        return res.status(400).json({ error: 'Invalid parentId' })
+      }
+      const parentParentId = parent[0].values[0][1]
+      if (parentParentId != null) {
+        return res.status(400).json({ error: '父菜单必须是一级菜单（系统仅支持两级菜单）' })
+      }
+
+      const hasChildren = db.exec('SELECT 1 FROM menus WHERE parent_id = ? LIMIT 1', [menuId])
+      if (hasChildren[0]?.values?.length) {
+        return res.status(400).json({ error: '该菜单含有子菜单，无法挂到其他父菜单下（否则会超过两级）' })
+      }
+    }
+
+    db.run(
+      `
+        UPDATE menus
+        SET label = ?,
+            path = ?,
+            parent_id = ?,
+            sort_order = ?,
+            is_active = ?,
+            updated_at = DATETIME('now', 'localtime')
+        WHERE id = ?
+      `,
+      [label, normalizedPath, parentId, sortOrder, isActive ? 1 : 0, menuId]
+    )
+
+    if (!isActive) {
+      db.run(
+        `
+          UPDATE menus
+          SET is_active = 0,
+              updated_at = DATETIME('now', 'localtime')
+          WHERE parent_id = ?
+        `,
+        [menuId]
+      )
+    }
+
+    saveDatabase()
+    res.json({
+      menu: {
+        id: menuId,
+        menuKey: existingMenuKey,
+        label,
+        path: normalizedPath,
+        parentId,
+        sortOrder,
+        isActive,
+      }
+    })
+  } catch (error) {
+    console.error('Update menu error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.delete('/rbac/menus/:id', async (req, res) => {
+  try {
+    const menuId = Number(req.params.id)
+    if (!Number.isFinite(menuId) || menuId <= 0) {
+      return res.status(400).json({ error: 'Invalid menu id' })
+    }
+
+    const db = await getDatabase()
+    const subtree = db.exec(
+      `
+        WITH RECURSIVE subtree(id, menu_key) AS (
+          SELECT id, menu_key
+          FROM menus
+          WHERE id = ?
+          UNION ALL
+          SELECT m.id, m.menu_key
+          FROM menus m
+          JOIN subtree s ON m.parent_id = s.id
+        )
+        SELECT id, menu_key FROM subtree
+      `,
+      [menuId]
+    )
+    const rows = subtree?.[0]?.values || []
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Menu not found' })
+    }
+
+    const ids = rows.map(row => Number(row[0])).filter(id => Number.isFinite(id) && id > 0)
+    const keys = rows.map(row => String(row[1] || '').trim()).filter(Boolean)
+
+    for (const key of keys) {
+      db.run(
+        `
+          INSERT OR IGNORE INTO deleted_menu_keys (menu_key, deleted_at)
+          VALUES (?, DATETIME('now', 'localtime'))
+        `,
+        [key]
+      )
+    }
+
+    const placeholders = ids.map(() => '?').join(',')
+    db.run(`DELETE FROM role_menus WHERE menu_id IN (${placeholders})`, ids)
+    db.run(`DELETE FROM menus WHERE id IN (${placeholders})`, ids)
+
+    saveDatabase()
+    res.json({ message: 'Menu deleted' })
+  } catch (error) {
+    console.error('Delete menu error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/rbac/roles', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const rolesResult = db.exec('SELECT id, role_key, role_name, description FROM roles ORDER BY id ASC')
+    const roleMenusResult = db.exec(
+      `
+        SELECT rm.role_id, m.menu_key
+        FROM role_menus rm
+        JOIN menus m ON m.id = rm.menu_id
+        ORDER BY rm.role_id ASC, m.id ASC
+      `
+    )
+
+    const roleMenusMap = new Map()
+    for (const row of roleMenusResult[0]?.values || []) {
+      const roleId = row[0]
+      const menuKey = row[1]
+      const list = roleMenusMap.get(roleId) || []
+      list.push(menuKey)
+      roleMenusMap.set(roleId, list)
+    }
+
+    const roles = (rolesResult[0]?.values || []).map(row => ({
+      id: row[0],
+      roleKey: row[1],
+      roleName: row[2],
+      description: row[3] || '',
+      menuKeys: roleMenusMap.get(row[0]) || [],
+    }))
+
+    res.json({ roles })
+  } catch (error) {
+    console.error('Get roles error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/rbac/roles', async (req, res) => {
+  try {
+    const roleKey = String(req.body?.roleKey || '').trim()
+    const roleName = String(req.body?.roleName || '').trim()
+    const description = String(req.body?.description || '').trim()
+    const menuKeys = Array.isArray(req.body?.menuKeys) ? req.body.menuKeys.map(String) : []
+
+    if (!/^[a-z][a-z0-9_]{2,63}$/.test(roleKey)) {
+      return res.status(400).json({ error: 'Invalid roleKey' })
+    }
+    if (!roleName) {
+      return res.status(400).json({ error: 'roleName is required' })
+    }
+
+    const db = await getDatabase()
+    const existing = db.exec('SELECT id FROM roles WHERE role_key = ? LIMIT 1', [roleKey])
+    if (existing[0]?.values?.length) {
+      return res.status(409).json({ error: 'Role already exists' })
+    }
+
+    db.run(
+      `
+        INSERT INTO roles (role_key, role_name, description, created_at, updated_at)
+        VALUES (?, ?, ?, DATETIME('now', 'localtime'), DATETIME('now', 'localtime'))
+      `,
+      [roleKey, roleName, description]
+    )
+
+    const created = db.exec('SELECT id FROM roles WHERE role_key = ? LIMIT 1', [roleKey])
+    const roleId = created[0]?.values?.length ? created[0].values[0][0] : null
+
+    if (roleId && menuKeys.length) {
+      const normalizedKeys = [...new Set(menuKeys.map(String).map(s => s.trim()).filter(Boolean))]
+      const placeholders = normalizedKeys.map(() => '?').join(',')
+      const menusResult = db.exec(
+        `SELECT id, menu_key FROM menus WHERE menu_key IN (${placeholders})`,
+        normalizedKeys
+      )
+      const found = new Set((menusResult[0]?.values || []).map(row => row[1]))
+      const missing = normalizedKeys.filter(key => !found.has(key))
+      if (missing.length) {
+        return res.status(400).json({ error: 'Unknown menuKeys', missing })
+      }
+      for (const row of menusResult[0]?.values || []) {
+        db.run(
+          'INSERT OR IGNORE INTO role_menus (role_id, menu_id) VALUES (?, ?)',
+          [roleId, row[0]]
+        )
+      }
+    }
+
+    saveDatabase()
+    res.json({ id: roleId, roleKey, roleName, description, menuKeys })
+  } catch (error) {
+    console.error('Create role error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/rbac/roles/:id/menus', async (req, res) => {
+  try {
+    const roleId = Number(req.params.id)
+    if (!Number.isFinite(roleId) || roleId <= 0) {
+      return res.status(400).json({ error: 'Invalid role id' })
+    }
+
+    const menuKeys = Array.isArray(req.body?.menuKeys) ? req.body.menuKeys.map(String) : []
+    const normalizedKeys = [...new Set(menuKeys.map(String).map(s => s.trim()).filter(Boolean))]
+
+    const db = await getDatabase()
+    const roleExists = db.exec('SELECT id FROM roles WHERE id = ? LIMIT 1', [roleId])
+    if (!roleExists[0]?.values?.length) {
+      return res.status(404).json({ error: 'Role not found' })
+    }
+
+    db.run('DELETE FROM role_menus WHERE role_id = ?', [roleId])
+
+    if (normalizedKeys.length) {
+      const placeholders = normalizedKeys.map(() => '?').join(',')
+      const menusResult = db.exec(
+        `SELECT id, menu_key FROM menus WHERE menu_key IN (${placeholders})`,
+        normalizedKeys
+      )
+      const found = new Set((menusResult[0]?.values || []).map(row => row[1]))
+      const missing = normalizedKeys.filter(key => !found.has(key))
+      if (missing.length) {
+        return res.status(400).json({ error: 'Unknown menuKeys', missing })
+      }
+      for (const row of menusResult[0]?.values || []) {
+        db.run(
+          'INSERT OR IGNORE INTO role_menus (role_id, menu_id) VALUES (?, ?)',
+          [roleId, row[0]]
+        )
+      }
+    }
+
+    saveDatabase()
+    res.json({ roleId, menuKeys: normalizedKeys })
+  } catch (error) {
+    console.error('Update role menus error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/rbac/users', async (req, res) => {
+  try {
+    const db = await getDatabase()
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
+    const search = String(req.query.search || '').trim().toLowerCase()
+
+    const conditions = []
+    const params = []
+
+    if (search) {
+      const keyword = `%${search}%`
+      conditions.push('(LOWER(username) LIKE ? OR LOWER(email) LIKE ? OR LOWER(invite_code) LIKE ?)')
+      params.push(keyword, keyword, keyword)
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    const countResult = db.exec(`SELECT COUNT(*) FROM users ${whereClause}`, params)
+    const total = countResult[0]?.values?.[0]?.[0] || 0
+
+    const offset = (page - 1) * pageSize
+    const usersResult = db.exec(
+      `
+        SELECT id, username, email, created_at, invite_code, invited_by_user_id, COALESCE(invite_enabled, 1), COALESCE(points, 0)
+        FROM users
+        ${whereClause}
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, pageSize, offset]
+    )
+
+    const userRows = usersResult[0]?.values || []
+    const userIds = userRows.map(row => row[0]).filter(Boolean)
+
+    const rolesByUser = new Map()
+    if (userIds.length) {
+      const placeholders = userIds.map(() => '?').join(',')
+      const rolesResult = db.exec(
+        `
+          SELECT ur.user_id, r.role_key, r.role_name
+          FROM user_roles ur
+          JOIN roles r ON r.id = ur.role_id
+          WHERE ur.user_id IN (${placeholders})
+          ORDER BY ur.user_id ASC, r.id ASC
+        `,
+        userIds
+      )
+
+      for (const row of rolesResult[0]?.values || []) {
+        const userId = row[0]
+        const roleKey = row[1]
+        const roleName = row[2]
+        const list = rolesByUser.get(userId) || []
+        list.push({ roleKey, roleName })
+        rolesByUser.set(userId, list)
+      }
+    }
+
+    const invitedCountByUser = new Map()
+    const orderCountByUser = new Map()
+    if (userIds.length) {
+      const placeholders = userIds.map(() => '?').join(',')
+      const inviteCountResult = db.exec(
+        `
+          SELECT invited_by_user_id, COUNT(*)
+          FROM users
+          WHERE invited_by_user_id IN (${placeholders})
+          GROUP BY invited_by_user_id
+        `,
+        userIds
+      )
+      for (const row of inviteCountResult[0]?.values || []) {
+        invitedCountByUser.set(Number(row[0]), Number(row[1] || 0))
+      }
+
+      const orderCountResult = db.exec(
+        `
+          SELECT user_id, COUNT(*)
+          FROM purchase_orders
+          WHERE user_id IN (${placeholders})
+          GROUP BY user_id
+        `,
+        userIds
+      )
+      for (const row of orderCountResult[0]?.values || []) {
+        orderCountByUser.set(Number(row[0]), Number(row[1] || 0))
+      }
+    }
+
+    const users = userRows.map(row => ({
+      id: row[0],
+      username: row[1],
+      email: row[2],
+      createdAt: row[3],
+      inviteCode: row[4] || null,
+      invitedByUserId: row[5] || null,
+      inviteEnabled: Number(row[6] ?? 1) !== 0,
+      points: Number(row[7] || 0),
+      invitedCount: invitedCountByUser.get(Number(row[0])) || 0,
+      orderCount: orderCountByUser.get(Number(row[0])) || 0,
+      roles: rolesByUser.get(row[0]) || [],
+    }))
+
+    res.json({
+      users,
+      pagination: {
+        page,
+        pageSize,
+        total,
+      }
+    })
+  } catch (error) {
+    console.error('Get users error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/rbac/users/:id/points-ledger', async (req, res) => {
+  try {
+    const userId = Number(req.params.id)
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'Invalid user id' })
+    }
+
+    const db = await getDatabase()
+    const userExists = db.exec('SELECT 1 FROM users WHERE id = ? LIMIT 1', [userId])
+    if (!userExists[0]?.values?.length) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    const limit = Math.min(100, Math.max(1, toInt(req.query.limit, 20)))
+    const beforeId = req.query.beforeId != null ? toInt(req.query.beforeId, 0) : null
+    const fetched = listUserPointsLedger(db, { userId, limit: limit + 1, beforeId })
+    const hasMore = fetched.length > limit
+    const records = hasMore ? fetched.slice(0, limit) : fetched
+    const nextBeforeId = hasMore && records.length ? records[records.length - 1].id : null
+
+    res.json({
+      records,
+      page: {
+        limit,
+        hasMore,
+        nextBeforeId
+      }
+    })
+  } catch (error) {
+    console.error('List user points ledger error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/rbac/users/:id/points', async (req, res) => {
+  try {
+    const userId = Number(req.params.id)
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'Invalid user id' })
+    }
+
+    const pointsRaw = req.body?.points
+    const pointsText = String(pointsRaw ?? '').trim()
+    if (!/^[0-9]{1,9}$/.test(pointsText)) {
+      return res.status(400).json({ error: 'Invalid points' })
+    }
+
+    const targetPoints = toInt(pointsText, NaN)
+    if (!Number.isFinite(targetPoints) || targetPoints < 0) {
+      return res.status(400).json({ error: 'Invalid points' })
+    }
+
+    const expectedRaw = req.body?.expectedPoints
+    const hasExpected = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'expectedPoints')
+    let expectedPoints = null
+    if (hasExpected) {
+      const expectedText = String(expectedRaw ?? '').trim()
+      if (!/^[0-9]{1,9}$/.test(expectedText)) {
+        return res.status(400).json({ error: 'Invalid expectedPoints' })
+      }
+      const parsedExpected = toInt(expectedText, NaN)
+      if (!Number.isFinite(parsedExpected) || parsedExpected < 0) {
+        return res.status(400).json({ error: 'Invalid expectedPoints' })
+      }
+      expectedPoints = parsedExpected
+    }
+
+    const actorUserId = Number(req.user?.id)
+    const actorRefType = Number.isFinite(actorUserId) && actorUserId > 0 ? 'admin_user' : null
+    const actorRefId = Number.isFinite(actorUserId) && actorUserId > 0 ? String(actorUserId) : null
+
+    const db = await getDatabase()
+
+    const result = await withLocks([`points:user:${userId}`], async () => {
+      const userResult = db.exec('SELECT COALESCE(points, 0) FROM users WHERE id = ? LIMIT 1', [userId])
+      if (!userResult[0]?.values?.length) {
+        return { ok: false, status: 404, error: 'User not found' }
+      }
+
+      const currentPoints = Number(userResult[0].values[0][0] || 0)
+      if (expectedPoints != null && currentPoints !== expectedPoints) {
+        return { ok: false, status: 409, error: 'Points changed', currentPoints }
+      }
+
+      if (currentPoints === targetPoints) {
+        return { ok: false, status: 400, error: 'No change', currentPoints }
+      }
+
+      const deltaPoints = targetPoints - currentPoints
+      db.run('UPDATE users SET points = ? WHERE id = ?', [targetPoints, userId])
+
+      const ledgerId = safeInsertPointsLedgerEntry(db, {
+        userId,
+        deltaPoints,
+        pointsBefore: currentPoints,
+        pointsAfter: targetPoints,
+        action: 'admin_set_points',
+        refType: actorRefType,
+        refId: actorRefId,
+        remark: '系统调整',
+      })
+
+      saveDatabase()
+
+      const user = getUserWithRoles(db, userId)
+      return { ok: true, user, ledgerId }
+    })
+
+    if (!result?.ok) {
+      const status = Number(result?.status) || 400
+      const payload = { error: result?.error || 'Failed to set points' }
+      if (result?.currentPoints != null) payload.currentPoints = result.currentPoints
+      return res.status(status).json(payload)
+    }
+
+    res.json({ user: result.user, ledgerId: result.ledgerId ?? null })
+  } catch (error) {
+    console.error('Set user points error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/rbac/users/:id/orders', async (req, res) => {
+  try {
+    const userId = Number(req.params.id)
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'Invalid user id' })
+    }
+
+    const db = await getDatabase()
+    const userExists = db.exec('SELECT 1 FROM users WHERE id = ? LIMIT 1', [userId])
+    if (!userExists[0]?.values?.length) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
+    const offset = (page - 1) * pageSize
+
+    const countResult = db.exec(
+      'SELECT COUNT(*) FROM purchase_orders WHERE user_id = ?',
+      [userId]
+    )
+    const total = Number(countResult[0]?.values?.[0]?.[0] || 0)
+
+    const result = db.exec(
+      `
+        SELECT order_no, zpay_trade_no, email, product_name, amount, service_days, order_type, pay_type, status,
+               created_at, paid_at, redeemed_at, invite_status, redeem_error,
+               refunded_at, refund_amount, refund_message, email_sent_at, zpay_img
+        FROM purchase_orders
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      `,
+      [userId, pageSize, offset]
+    )
+
+    const rows = result[0]?.values || []
+    res.json({
+      orders: rows.map(row => ({
+        orderNo: row[0],
+        tradeNo: row[1] || null,
+        email: row[2],
+        productName: row[3],
+        amount: row[4],
+        serviceDays: Number(row[5]) || 30,
+        orderType: normalizeOrderType(row[6]),
+        payType: row[7] || null,
+        img: row[18] || null,
+        status: row[8],
+        createdAt: row[9],
+        paidAt: row[10] || null,
+        redeemedAt: row[11] || null,
+        inviteStatus: row[12] || null,
+        redeemError: row[13] || null,
+        refundedAt: row[14] || null,
+        refundAmount: row[15] || null,
+        refundMessage: row[16] || null,
+        emailSentAt: row[17] || null
+      })),
+      pagination: { page, pageSize, total }
+    })
+  } catch (error) {
+    console.error('List user orders error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/rbac/users/:id/roles', async (req, res) => {
+  try {
+    const userId = Number(req.params.id)
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'Invalid user id' })
+    }
+
+    const roleKeys = Array.isArray(req.body?.roleKeys)
+      ? req.body.roleKeys.map(String).map(s => s.trim()).filter(Boolean)
+      : []
+
+    if (!roleKeys.length) {
+      return res.status(400).json({ error: 'roleKeys is required' })
+    }
+
+    const uniqueRoleKeys = [...new Set(roleKeys)]
+    const db = await getDatabase()
+
+    const userExists = db.exec('SELECT id FROM users WHERE id = ? LIMIT 1', [userId])
+    if (!userExists[0]?.values?.length) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    const placeholders = uniqueRoleKeys.map(() => '?').join(',')
+    const rolesResult = db.exec(
+      `SELECT id, role_key FROM roles WHERE role_key IN (${placeholders})`,
+      uniqueRoleKeys
+    )
+    const roleIds = (rolesResult[0]?.values || []).map(row => ({ id: row[0], roleKey: row[1] }))
+    const found = new Set(roleIds.map(item => item.roleKey))
+    const missing = uniqueRoleKeys.filter(key => !found.has(key))
+    if (missing.length) {
+      return res.status(400).json({ error: 'Unknown roleKeys', missing })
+    }
+
+    db.run('DELETE FROM user_roles WHERE user_id = ?', [userId])
+    for (const item of roleIds) {
+      db.run(
+        'INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)',
+        [userId, item.id]
+      )
+    }
+
+    saveDatabase()
+    res.json({ userId, roleKeys: uniqueRoleKeys })
+  } catch (error) {
+    console.error('Update user roles error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.put('/rbac/users/:id', async (req, res) => {
+  try {
+    const userId = Number(req.params.id)
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'Invalid user id' })
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {}
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(body, key)
+
+    const hasUsername = hasOwn('username')
+    const hasEmail = hasOwn('email')
+    const hasInviteEnabled = hasOwn('inviteEnabled')
+
+    const normalizeInviteEnabled = (value) => {
+      if (typeof value === 'boolean') return value
+      if (typeof value === 'number') return value !== 0
+      const text = String(value ?? '').trim().toLowerCase()
+      if (!text) return null
+      if (['1', 'true', 'yes', 'y', 'on'].includes(text)) return true
+      if (['0', 'false', 'no', 'n', 'off'].includes(text)) return false
+      return null
+    }
+
+    if (!hasUsername && !hasEmail && !hasInviteEnabled) {
+      return res.status(400).json({ error: 'No fields to update' })
+    }
+
+    const db = await getDatabase()
+
+    const userExists = db.exec('SELECT 1 FROM users WHERE id = ? LIMIT 1', [userId])
+    if (!userExists[0]?.values?.length) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    const updates = []
+    const params = []
+
+    if (hasUsername) {
+      const username = String(body?.username ?? '').trim()
+      if (!username) {
+        return res.status(400).json({ error: 'username is required' })
+      }
+
+      const duplicateUsername = db.exec(
+        'SELECT id FROM users WHERE lower(username) = lower(?) AND id != ? LIMIT 1',
+        [username, userId]
+      )
+      if (duplicateUsername[0]?.values?.length) {
+        return res.status(409).json({ error: 'username already exists' })
+      }
+
+      updates.push('username = ?')
+      params.push(username)
+    }
+
+    if (hasEmail) {
+      const email = normalizeEmail(body?.email)
+      if (!email) {
+        return res.status(400).json({ error: 'email is required' })
+      }
+      if (!EMAIL_REGEX.test(email)) {
+        return res.status(400).json({ error: 'Invalid email' })
+      }
+
+      const duplicateEmail = db.exec(
+        'SELECT id FROM users WHERE lower(email) = lower(?) AND id != ? LIMIT 1',
+        [email, userId]
+      )
+      if (duplicateEmail[0]?.values?.length) {
+        return res.status(409).json({ error: 'email already exists' })
+      }
+
+      updates.push('email = ?')
+      params.push(email)
+    }
+
+    if (hasInviteEnabled) {
+      const parsed = normalizeInviteEnabled(body?.inviteEnabled)
+      if (parsed === null) {
+        return res.status(400).json({ error: 'Invalid inviteEnabled' })
+      }
+      updates.push('invite_enabled = ?')
+      params.push(parsed ? 1 : 0)
+    }
+
+    if (!updates.length) {
+      return res.status(400).json({ error: 'No fields to update' })
+    }
+
+    db.run(
+      `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
+      [...params, userId]
+    )
+    saveDatabase()
+
+    const user = getUserWithRoles(db, userId)
+    res.json({ user })
+  } catch (error) {
+    console.error('Update user error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.delete('/rbac/users/:id', async (req, res) => {
+  try {
+    const userId = Number(req.params.id)
+    if (!Number.isFinite(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'Invalid user id' })
+    }
+
+    const currentUserId = Number(req.user?.id)
+    if (Number.isFinite(currentUserId) && currentUserId === userId) {
+      return res.status(400).json({ error: '不能删除当前登录用户' })
+    }
+
+    const db = await getDatabase()
+    const userResult = db.exec('SELECT username FROM users WHERE id = ? LIMIT 1', [userId])
+    const username = userResult[0]?.values?.length ? String(userResult[0].values[0][0] || '') : ''
+    if (!username) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+    if (username === 'admin') {
+      return res.status(403).json({ error: '不能删除系统默认管理员' })
+    }
+
+    db.run('DELETE FROM user_roles WHERE user_id = ?', [userId])
+    db.run('UPDATE users SET invited_by_user_id = NULL WHERE invited_by_user_id = ?', [userId])
+    db.run('DELETE FROM users WHERE id = ?', [userId])
+
+    saveDatabase()
+    res.json({ message: 'deleted' })
+  } catch (error) {
+    console.error('Delete user error:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// 封号账号补录管理
+router.get('/account-recovery/banned-accounts', async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
+    const search = String(req.query.search || '').trim().toLowerCase()
+    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
+    const threshold = `-${days} days`
+
+    const db = await getDatabase()
+
+    // Always show banned accounts (unprocessed), even when no eligible codes exist in the window.
+    const accountConditions = [
+      'ga.is_banned = 1',
+      'COALESCE(ga.ban_processed, 0) = 0',
+    ]
+    const countParams = []
+
+    if (search) {
+      accountConditions.push('LOWER(ga.email) LIKE ?')
+      countParams.push(`%${search}%`)
+    }
+
+    const whereAccounts = accountConditions.length ? `WHERE ${accountConditions.join(' AND ')}` : ''
+
+    const countResult = db.exec(
+      `
+        SELECT COUNT(*)
+        FROM gpt_accounts ga
+        ${whereAccounts}
+      `,
+      countParams
+    )
+    const total = Number(countResult[0]?.values?.[0]?.[0] || 0)
+    const offset = (page - 1) * pageSize
+
+	    const dataResult = db.exec(
+	      `
+	        WITH log_flags AS (
+	          SELECT
+	            original_code_id,
+	            COUNT(*) AS attempts,
+	            MAX(id) AS latest_id
+	          FROM account_recovery_logs
+	          GROUP BY original_code_id
+	        ),
+	        log_latest AS (
+	          SELECT
+	            ar.original_code_id,
+	            ar.status
+	          FROM account_recovery_logs ar
+	          JOIN log_flags lf ON lf.latest_id = ar.id
+	        ),
+	        completed_flags AS (
+	          SELECT
+	            original_code_id,
+	            MAX(id) AS latest_completed_id
+	          FROM account_recovery_logs
+	          WHERE status IN ('success', 'skipped')
+	          GROUP BY original_code_id
+	        ),
+	        completed_latest AS (
+	          SELECT
+	            ar.original_code_id,
+	            ar.recovery_account_email
+	          FROM account_recovery_logs ar
+	          JOIN completed_flags cf ON cf.latest_completed_id = ar.id
+	        ),
+	        eligible_codes AS (
+	          SELECT
+	            ga.id AS account_id,
+	            rc.id AS original_code_id,
+	            rc.redeemed_at AS redeemed_at,
+	            rc.account_email AS original_account_email
+	          FROM gpt_accounts ga
+	          JOIN redemption_codes rc ON lower(rc.account_email) = lower(ga.email)
+	          WHERE ga.is_banned = 1
+	            AND rc.is_redeemed = 1
+            AND rc.redeemed_at IS NOT NULL
+            AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+            AND (
+              EXISTS (
+                SELECT 1
+                FROM purchase_orders po
+                WHERE (po.code_id = rc.id OR (po.code_id IS NULL AND po.code = rc.code))
+                  AND po.created_at >= DATETIME('now', 'localtime', ?)
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM credit_orders co
+                WHERE (co.code_id = rc.id OR (co.code_id IS NULL AND co.code = rc.code))
+                  AND co.created_at >= DATETIME('now', 'localtime', ?)
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM xhs_orders xo
+                WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+                  AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM xianyu_orders xo
+                WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+                  AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+              )
+            )
+            AND COALESCE(
+              NULLIF((
+                SELECT po2.order_type
+                FROM purchase_orders po2
+                WHERE (po2.code_id = rc.id OR (po2.code_id IS NULL AND po2.code = rc.code))
+                ORDER BY po2.created_at DESC
+                LIMIT 1
+              ), ''),
+              NULLIF(rc.order_type, ''),
+	              'warranty'
+	            ) != 'no_warranty'
+	        ),
+	        eligible_enriched AS (
+	          SELECT
+	            ec.account_id,
+	            ec.original_code_id,
+	            ec.redeemed_at,
+	            COALESCE(lf.attempts, 0) AS attempts,
+	            ll.status AS latest_status,
+	            COALESCE(cl.recovery_account_email, ec.original_account_email) AS current_account_email
+	          FROM eligible_codes ec
+	          LEFT JOIN log_flags lf ON lf.original_code_id = ec.original_code_id
+	          LEFT JOIN log_latest ll ON ll.original_code_id = ec.original_code_id
+	          LEFT JOIN completed_latest cl ON cl.original_code_id = ec.original_code_id
+	        ),
+	        eligible_with_current AS (
+	          SELECT
+	            ee.account_id,
+	            ee.original_code_id,
+	            ee.redeemed_at,
+	            ee.attempts,
+	            ee.latest_status,
+	            CASE
+	              WHEN current_ga.id IS NULL THEN 1
+	              ELSE COALESCE(current_ga.is_banned, 0)
+	            END AS current_is_banned
+	          FROM eligible_enriched ee
+	          LEFT JOIN gpt_accounts current_ga ON lower(current_ga.email) = lower(ee.current_account_email)
+	        ),
+	        eligible_agg AS (
+	          SELECT
+	            account_id,
+	            COUNT(original_code_id) AS impacted_total,
+	            SUM(CASE WHEN current_is_banned = 0 THEN 1 ELSE 0 END) AS done_count,
+	            SUM(CASE WHEN current_is_banned = 1 AND latest_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+	            SUM(CASE WHEN current_is_banned = 1 AND (latest_status IS NULL OR latest_status != 'failed') THEN 1 ELSE 0 END) AS pending_count,
+	            MAX(redeemed_at) AS latest_redeemed_at
+	          FROM eligible_with_current
+	          GROUP BY account_id
+	        )
+	        SELECT
+	          ga.id,
+	          ga.email,
+          COALESCE(ea.impacted_total, 0) AS impacted_total,
+          COALESCE(ea.done_count, 0) AS done_count,
+          COALESCE(ea.failed_count, 0) AS failed_count,
+          COALESCE(ea.pending_count, 0) AS pending_count,
+          ea.latest_redeemed_at
+        FROM gpt_accounts ga
+        LEFT JOIN eligible_agg ea ON ea.account_id = ga.id
+        ${whereAccounts}
+        ORDER BY latest_redeemed_at DESC
+        LIMIT ? OFFSET ?
+      `,
+      [threshold, threshold, threshold, threshold, threshold, ...countParams, pageSize, offset]
+    )
+
+    const accounts = (dataResult[0]?.values || []).map(row => ({
+      id: Number(row[0]),
+      email: String(row[1] || ''),
+      impactedCount: Number(row[2] || 0),
+      doneCount: Number(row[3] || 0),
+      failedCount: Number(row[4] || 0),
+      pendingCount: Number(row[5] || 0),
+      latestRedeemedAt: row[6] ? String(row[6]) : null
+    }))
+
+    return res.json({
+      accounts,
+      pagination: {
+        page,
+        pageSize,
+        total
+      }
+    })
+  } catch (error) {
+    console.error('Get banned recovery accounts error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.patch('/account-recovery/banned-accounts/:accountId/processed', async (req, res) => {
+  try {
+    const accountId = Number(req.params.accountId)
+    if (!Number.isFinite(accountId) || accountId <= 0) {
+      return res.status(400).json({ error: 'Invalid accountId' })
+    }
+
+    const raw = req.body?.processed ?? req.body?.value
+    const processed = typeof raw === 'boolean' ? raw : Number(raw ?? 1) !== 0
+
+    const db = await getDatabase()
+    const accountResult = db.exec(
+      `
+        SELECT id, email, COALESCE(is_banned, 0) AS is_banned
+        FROM gpt_accounts
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [accountId]
+    )
+    const row = accountResult[0]?.values?.[0]
+    if (!row) {
+      return res.status(404).json({ error: 'Account not found' })
+    }
+    const isBanned = Number(row[2] || 0) === 1
+    if (!isBanned) {
+      return res.status(400).json({ error: 'Account is not banned' })
+    }
+
+    db.run(
+      `UPDATE gpt_accounts SET ban_processed = ?, updated_at = DATETIME('now', 'localtime') WHERE id = ?`,
+      [processed ? 1 : 0, accountId]
+    )
+    saveDatabase()
+
+    const updatedResult = db.exec(
+      `
+        SELECT id, email, COALESCE(ban_processed, 0) AS ban_processed, updated_at
+        FROM gpt_accounts
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [accountId]
+    )
+    const updatedRow = updatedResult[0]?.values?.[0]
+
+    return res.json({
+      account: {
+        id: Number(updatedRow?.[0] ?? accountId),
+        email: String(updatedRow?.[1] || row[1] || ''),
+        banProcessed: Number(updatedRow?.[2] || 0) === 1,
+        updatedAt: updatedRow?.[3] ? String(updatedRow[3]) : null
+      }
+    })
+  } catch (error) {
+    console.error('Update banned account processed error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/account-recovery/banned-accounts/:accountId/redeems', async (req, res) => {
+  try {
+    const accountId = Number(req.params.accountId)
+    if (!Number.isFinite(accountId) || accountId <= 0) {
+      return res.status(400).json({ error: 'Invalid accountId' })
+    }
+
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 20))
+    const search = String(req.query.search || '').trim().toLowerCase()
+    const status = String(req.query.status || 'pending').trim().toLowerCase()
+    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
+    const threshold = `-${days} days`
+
+    const db = await getDatabase()
+
+    const conditions = [
+      'ga.id = ?',
+      'ga.is_banned = 1',
+      'rc.is_redeemed = 1',
+      'rc.redeemed_at IS NOT NULL',
+      `rc.redeemed_at >= DATETIME('now', 'localtime', ?)`,
+      `
+        (
+          EXISTS (
+            SELECT 1
+            FROM purchase_orders po
+            WHERE (po.code_id = rc.id OR (po.code_id IS NULL AND po.code = rc.code))
+              AND po.created_at >= DATETIME('now', 'localtime', ?)
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM credit_orders co
+            WHERE (co.code_id = rc.id OR (co.code_id IS NULL AND co.code = rc.code))
+              AND co.created_at >= DATETIME('now', 'localtime', ?)
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM xhs_orders xo
+            WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+              AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM xianyu_orders xo
+            WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+              AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+          )
+        )
+      `.trim(),
+      `
+        COALESCE(
+          NULLIF((
+            SELECT po2.order_type
+            FROM purchase_orders po2
+            WHERE (po2.code_id = rc.id OR (po2.code_id IS NULL AND po2.code = rc.code))
+            ORDER BY po2.created_at DESC
+            LIMIT 1
+          ), ''),
+          NULLIF(rc.order_type, ''),
+          'warranty'
+        ) != 'no_warranty'
+      `.trim(),
+    ]
+    const params = [accountId, threshold, threshold, threshold, threshold, threshold]
+
+    if (search) {
+      conditions.push('(LOWER(rc.code) LIKE ? OR LOWER(rc.redeemed_by) LIKE ?)')
+      params.push(`%${search}%`, `%${search}%`)
+    }
+
+    const currentBannedExpression = `
+      CASE
+        WHEN current_ga.id IS NULL THEN 1
+        ELSE COALESCE(current_ga.is_banned, 0)
+      END
+    `.trim()
+
+    if (status === 'pending') {
+      conditions.push(`(${currentBannedExpression}) = 1`)
+      conditions.push(`(ll.status IS NULL OR ll.status != 'failed')`)
+    } else if (status === 'done') {
+      conditions.push(`(${currentBannedExpression}) = 0`)
+    } else if (status === 'failed') {
+      conditions.push(`(${currentBannedExpression}) = 1`)
+      conditions.push(`ll.status = 'failed'`)
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+
+    const countResult = db.exec(
+      `
+        WITH log_flags AS (
+          SELECT
+            original_code_id,
+            COUNT(*) AS attempts,
+            MAX(id) AS latest_id
+          FROM account_recovery_logs
+          GROUP BY original_code_id
+        ),
+        log_latest AS (
+          SELECT
+            ar.original_code_id,
+            ar.status
+          FROM account_recovery_logs ar
+          JOIN log_flags lf ON lf.latest_id = ar.id
+        ),
+        completed_flags AS (
+          SELECT
+            original_code_id,
+            MAX(id) AS latest_completed_id
+          FROM account_recovery_logs
+          WHERE status IN ('success', 'skipped')
+          GROUP BY original_code_id
+        ),
+        completed_latest AS (
+          SELECT
+            ar.original_code_id,
+            ar.recovery_account_email
+          FROM account_recovery_logs ar
+          JOIN completed_flags cf ON cf.latest_completed_id = ar.id
+        )
+        SELECT COUNT(*)
+        FROM redemption_codes rc
+        JOIN gpt_accounts ga ON lower(ga.email) = lower(rc.account_email)
+        LEFT JOIN log_flags lf ON lf.original_code_id = rc.id
+        LEFT JOIN log_latest ll ON ll.original_code_id = rc.id
+        LEFT JOIN completed_latest cl ON cl.original_code_id = rc.id
+        LEFT JOIN gpt_accounts current_ga ON lower(current_ga.email) = lower(COALESCE(NULLIF(TRIM(cl.recovery_account_email), ''), rc.account_email))
+        ${whereClause}
+      `,
+      params
+    )
+    const total = Number(countResult[0]?.values?.[0]?.[0] || 0)
+    const offset = (page - 1) * pageSize
+
+    const dataResult = db.exec(
+      `
+        WITH log_flags AS (
+          SELECT
+            original_code_id,
+            COUNT(*) AS attempts,
+            MAX(id) AS latest_id
+          FROM account_recovery_logs
+          GROUP BY original_code_id
+        ),
+        log_latest AS (
+          SELECT
+            ar.original_code_id,
+            ar.id,
+            ar.status,
+            ar.error_message,
+            ar.recovery_mode,
+            ar.recovery_code,
+            ar.recovery_account_email,
+            ar.created_at
+          FROM account_recovery_logs ar
+          JOIN log_flags lf ON lf.latest_id = ar.id
+        ),
+        completed_flags AS (
+          SELECT
+            original_code_id,
+            MAX(id) AS latest_completed_id
+          FROM account_recovery_logs
+          WHERE status IN ('success', 'skipped')
+          GROUP BY original_code_id
+        ),
+        completed_latest AS (
+          SELECT
+            ar.original_code_id,
+            ar.recovery_account_email
+          FROM account_recovery_logs ar
+          JOIN completed_flags cf ON cf.latest_completed_id = ar.id
+        )
+        SELECT
+          rc.id,
+          rc.code,
+          rc.channel,
+          rc.redeemed_at,
+          rc.redeemed_by,
+          rc.account_email,
+          COALESCE(lf.attempts, 0) AS attempts,
+          CASE
+            WHEN current_ga.id IS NULL THEN 1
+            ELSE COALESCE(current_ga.is_banned, 0)
+          END AS current_is_banned,
+          ll.id AS latest_log_id,
+          ll.status AS latest_status,
+          ll.error_message AS latest_error_message,
+          ll.recovery_mode AS latest_recovery_mode,
+          ll.recovery_code AS latest_recovery_code,
+          ll.recovery_account_email AS latest_recovery_account_email,
+          ll.created_at AS latest_created_at
+        FROM redemption_codes rc
+        JOIN gpt_accounts ga ON lower(ga.email) = lower(rc.account_email)
+        LEFT JOIN log_flags lf ON lf.original_code_id = rc.id
+        LEFT JOIN log_latest ll ON ll.original_code_id = rc.id
+        LEFT JOIN completed_latest cl ON cl.original_code_id = rc.id
+        LEFT JOIN gpt_accounts current_ga ON lower(current_ga.email) = lower(COALESCE(NULLIF(TRIM(cl.recovery_account_email), ''), rc.account_email))
+        ${whereClause}
+        ORDER BY rc.redeemed_at DESC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, pageSize, offset]
+    )
+
+    const redeems = (dataResult[0]?.values || []).map(row => {
+      const attempts = Number(row[6] || 0)
+      const currentIsBanned = Number(row[7] || 0) === 1
+      const latestStatus = row[9] ? String(row[9]) : ''
+      const state = currentIsBanned ? (latestStatus === 'failed' ? 'failed' : 'pending') : 'done'
+      return {
+        originalCodeId: Number(row[0]),
+        code: String(row[1] || ''),
+        channel: String(row[2] || ''),
+        redeemedAt: row[3] ? String(row[3]) : null,
+        userEmail: extractEmailFromRedeemedBy(row[4]),
+        originalAccountEmail: String(row[5] || ''),
+        state,
+        attempts,
+        latest: row[8]
+          ? {
+              id: Number(row[8]),
+              status: String(row[9] || ''),
+              errorMessage: row[10] ? String(row[10]) : null,
+              recoveryMode: row[11] ? String(row[11]) : null,
+              recoveryCode: row[12] ? String(row[12]) : null,
+              recoveryAccountEmail: row[13] ? String(row[13]) : null,
+              createdAt: row[14] ? String(row[14]) : null
+            }
+          : null
+      }
+    })
+
+    return res.json({
+      redeems,
+      pagination: {
+        page,
+        pageSize,
+        total
+      }
+    })
+  } catch (error) {
+    console.error('Get banned account redeems error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.get('/account-recovery/logs', async (req, res) => {
+  try {
+    const originalCodeId = Number(req.query.originalCodeId || req.query.original_code_id)
+    if (!Number.isFinite(originalCodeId) || originalCodeId <= 0) {
+      return res.status(400).json({ error: 'originalCodeId is required' })
+    }
+
+    const db = await getDatabase()
+    const result = db.exec(
+      `
+        SELECT
+          id,
+          email,
+          original_code_id,
+          original_redeemed_at,
+          original_account_email,
+          recovery_mode,
+          recovery_code_id,
+          recovery_code,
+          recovery_account_email,
+          status,
+          error_message,
+          created_at,
+          updated_at
+        FROM account_recovery_logs
+        WHERE original_code_id = ?
+        ORDER BY id DESC
+      `,
+      [originalCodeId]
+    )
+    const logs = (result[0]?.values || []).map(row => ({
+      id: Number(row[0]),
+      email: String(row[1] || ''),
+      originalCodeId: Number(row[2]),
+      originalRedeemedAt: row[3] ? String(row[3]) : null,
+      originalAccountEmail: row[4] ? String(row[4]) : null,
+      recoveryMode: row[5] ? String(row[5]) : null,
+      recoveryCodeId: row[6] != null ? Number(row[6]) : null,
+      recoveryCode: row[7] ? String(row[7]) : null,
+      recoveryAccountEmail: row[8] ? String(row[8]) : null,
+      status: String(row[9] || ''),
+      errorMessage: row[10] ? String(row[10]) : null,
+      createdAt: row[11] ? String(row[11]) : null,
+      updatedAt: row[12] ? String(row[12]) : null
+    }))
+
+    return res.json({ logs })
+  } catch (error) {
+    console.error('Get account recovery logs error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+router.post('/account-recovery/recover', async (req, res) => {
+  try {
+    const rawIds = req.body?.originalCodeIds ?? req.body?.original_code_ids ?? []
+    const originalCodeIds = Array.isArray(rawIds)
+      ? rawIds.map(value => Number(value)).filter(value => Number.isFinite(value) && value > 0)
+      : []
+
+    if (originalCodeIds.length === 0) {
+      return res.status(400).json({ error: 'originalCodeIds is required' })
+    }
+    if (originalCodeIds.length > 200) {
+      return res.status(400).json({ error: 'originalCodeIds is too large (max 200)' })
+    }
+
+    const days = ACCOUNT_RECOVERY_WINDOW_DAYS
+    const threshold = `-${days} days`
+
+    const db = await getDatabase()
+    const results = []
+
+	    for (const originalCodeId of originalCodeIds) {
+	      const outcome = await withLocks([`admin-account-recovery:${originalCodeId}`], async () => {
+	        const originalResult = db.exec(
+	          `
+	            SELECT
+	              rc.id,
+              rc.code,
+              rc.redeemed_at,
+              rc.redeemed_by,
+              rc.account_email,
+              ga.id,
+              ga.email
+	            FROM redemption_codes rc
+	            JOIN gpt_accounts ga ON lower(ga.email) = lower(rc.account_email)
+	            LEFT JOIN account_recovery_logs ar_recovery
+	              ON ar_recovery.recovery_code_id = rc.id
+	              AND ar_recovery.status IN ('success', 'skipped')
+	            WHERE rc.id = ?
+	              AND rc.is_redeemed = 1
+	              AND rc.redeemed_at IS NOT NULL
+	              AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+	              AND ar_recovery.id IS NULL
+	              AND ga.is_banned = 1
+	              AND (
+	                EXISTS (
+	                  SELECT 1
+                  FROM purchase_orders po
+                  WHERE (po.code_id = rc.id OR (po.code_id IS NULL AND po.code = rc.code))
+                    AND po.created_at >= DATETIME('now', 'localtime', ?)
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM credit_orders co
+                  WHERE (co.code_id = rc.id OR (co.code_id IS NULL AND co.code = rc.code))
+                    AND co.created_at >= DATETIME('now', 'localtime', ?)
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM xhs_orders xo
+                  WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+                    AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM xianyu_orders xo
+                  WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+                    AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+                )
+              )
+              AND COALESCE(
+                NULLIF((
+                  SELECT po2.order_type
+                  FROM purchase_orders po2
+                  WHERE (po2.code_id = rc.id OR (po2.code_id IS NULL AND po2.code = rc.code))
+                  ORDER BY po2.created_at DESC
+                  LIMIT 1
+                ), ''),
+                NULLIF(rc.order_type, ''),
+                'warranty'
+              ) != 'no_warranty'
+            LIMIT 1
+          `,
+	          [originalCodeId, threshold, threshold, threshold, threshold, threshold]
+	        )
+
+	        const row = originalResult[0]?.values?.[0]
+	        if (!row) {
+	          return { originalCodeId, outcome: 'invalid', message: '兑换码不存在 / 不在窗口期 / 非封号账号 / 无质保订单' }
+	        }
+
+        const redeemedBy = extractEmailFromRedeemedBy(row[3])
+        if (!redeemedBy) {
+          return { originalCodeId, outcome: 'invalid', message: '兑换记录缺少有效用户邮箱' }
+        }
+
+	        const redeemedAt = row[2] ? String(row[2]) : null
+	        const originalAccountEmail = String(row[6] || row[4] || '')
+
+	        const completedLogResult = db.exec(
+	          `
+	            SELECT recovery_account_email
+	            FROM account_recovery_logs
+	            WHERE original_code_id = ?
+	              AND status IN ('success', 'skipped')
+	            ORDER BY id DESC
+	            LIMIT 1
+	          `,
+	          [originalCodeId]
+	        )
+	        const completedLogRow = completedLogResult[0]?.values?.[0]
+	        const currentAccountEmail = completedLogRow?.[0]
+	          ? normalizeEmail(completedLogRow[0])
+	          : normalizeEmail(originalAccountEmail)
+
+	        if (currentAccountEmail) {
+	          const currentAccountResult = db.exec(
+	            `
+	              SELECT COALESCE(is_banned, 0) AS is_banned
+	              FROM gpt_accounts
+	              WHERE lower(email) = ?
+	              LIMIT 1
+	            `,
+	            [currentAccountEmail]
+	          )
+	          const currentAccountRow = currentAccountResult[0]?.values?.[0]
+	          if (currentAccountRow && Number(currentAccountRow[0] || 0) === 0) {
+	            return { originalCodeId, outcome: 'already_done', message: '当前账号仍可用，无需补录' }
+	          }
+	        }
+
+	      const recoveryCodeResult = db.exec(
+	        `
+	          SELECT rc.id, rc.code, rc.channel, rc.account_email
+	          FROM redemption_codes rc
+	          JOIN gpt_accounts ga ON lower(ga.email) = lower(rc.account_email)
+	          WHERE rc.is_redeemed = 0
+	            AND rc.account_email IS NOT NULL
+	            AND COALESCE(ga.user_count, 0) + COALESCE(ga.invite_count, 0) < 6
+	            AND COALESCE(ga.is_banned, 0) = 0
+	            AND (rc.reserved_for_entry_id IS NULL OR rc.reserved_for_entry_id = 0)
+	            AND (rc.reserved_for_order_no IS NULL OR rc.reserved_for_order_no = '')
+	            AND (
+	                (
+	                  COALESCE(ga.is_open, 0) = 0
+	                  AND DATE(ga.created_at) >= DATE('now', 'localtime', '-7 day')
+	                )
+	                OR (
+	                  ga.is_open = 1
+	                  AND DATE(ga.created_at) = DATE('now', 'localtime')
+                )
+              )
+	            ORDER BY
+	              CASE
+	                WHEN COALESCE(ga.is_open, 0) = 0 AND DATE(ga.created_at) >= DATE('now', 'localtime', '-7 day') THEN 0
+	                ELSE 1
+	              END ASC,
+	              ga.created_at DESC,
+	              rc.created_at DESC
+            LIMIT 1
+          `
+        )
+
+        const recoveryRow = recoveryCodeResult[0]?.values?.[0]
+        if (!recoveryRow) {
+          recordAccountRecovery(db, {
+            email: redeemedBy,
+            originalCodeId,
+            originalRedeemedAt: redeemedAt,
+            originalAccountEmail,
+            recoveryMode: 'open-account',
+            status: 'failed',
+            errorMessage: '暂无可用补号账号兑换码'
+          })
+          saveDatabase()
+          return { originalCodeId, outcome: 'failed', message: '暂无可用补号账号兑换码' }
+        }
+
+        const recoveryCodeId = Number(recoveryRow[0])
+        const recoveryCode = String(recoveryRow[1] || '')
+        const recoveryChannel = String(recoveryRow[2] || 'common') || 'common'
+        const recoveryAccountEmail = String(recoveryRow[3] || '')
+        const skipCodeFormatValidation = recoveryChannel === 'xhs'
+
+        try {
+          const redemptionResult = await redeemCodeInternal({
+            code: recoveryCode,
+            email: redeemedBy,
+            channel: recoveryChannel,
+            skipCodeFormatValidation
+          })
+
+          recordAccountRecovery(db, {
+            email: redeemedBy,
+            originalCodeId,
+            originalRedeemedAt: redeemedAt,
+            originalAccountEmail,
+            recoveryMode: 'open-account',
+            recoveryCodeId,
+            recoveryCode,
+            recoveryAccountEmail: redemptionResult.metadata?.accountEmail || recoveryAccountEmail,
+            status: 'success'
+          })
+          saveDatabase()
+          return {
+            originalCodeId,
+            outcome: 'success',
+            message: '补录成功',
+            recovery: {
+              recoveryCodeId,
+              recoveryCode,
+              recoveryAccountEmail: redemptionResult.metadata?.accountEmail || recoveryAccountEmail
+            }
+          }
+        } catch (error) {
+          const statusCode = typeof error?.statusCode === 'number' ? error.statusCode : (typeof error?.status === 'number' ? error.status : 500)
+          recordAccountRecovery(db, {
+            email: redeemedBy,
+            originalCodeId,
+            originalRedeemedAt: redeemedAt,
+            originalAccountEmail,
+            recoveryMode: 'open-account',
+            recoveryCodeId,
+            recoveryCode,
+            recoveryAccountEmail,
+            status: 'failed',
+            errorMessage: error?.message || '补录失败'
+          })
+          saveDatabase()
+          return {
+            originalCodeId,
+            outcome: 'failed',
+            message: error?.message || '补录失败',
+            statusCode
+          }
+        }
+      })
+
+      results.push(outcome)
+    }
+
+    return res.json({ results })
+  } catch (error) {
+    console.error('Admin account recovery error:', error)
+    return res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+export default router
