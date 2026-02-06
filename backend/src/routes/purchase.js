@@ -1797,7 +1797,7 @@ router.get('/admin/orders', async (req, res) => {
   try {
     const db = await getDatabase()
     const page = Math.max(1, Number(req.query.page) || 1)
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 15))
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
     const search = (req.query.search || '').trim().toLowerCase()
     const status = req.query.status // 'pending_payment' | 'paid' | 'refunded' | 'expired' | 'failed' | undefined
 

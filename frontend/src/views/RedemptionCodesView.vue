@@ -96,6 +96,13 @@ const accountDemotionMeta = (accountEmail?: string | null) => {
     : { label: '未降级', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' }
 }
 
+const isAccountBanned = (accountEmail?: string | null) => {
+  const normalizedEmail = String(accountEmail || '').trim().toLowerCase()
+  if (!normalizedEmail) return false
+  const account = accountsByEmail.value.get(normalizedEmail)
+  return Boolean(account?.isBanned)
+}
+
 // 同步相关状态（参考账号管理的同步按钮交互）
 const syncingAccountId = ref<number | null>(null)
 const syncingAccountEmail = ref<string | null>(null)
@@ -223,6 +230,17 @@ const clearFilters = () => {
   statusFilter.value = '全部'
   currentPage.value = 1
   loadCodes()
+}
+
+const handleRefresh = async () => {
+  if (searchDebounceTimer) {
+    clearTimeout(searchDebounceTimer)
+    searchDebounceTimer = null
+  }
+  await Promise.all([
+    loadCodes(),
+    loadAccounts()
+  ])
 }
 
 const applySearchFromQuery = () => {
@@ -837,7 +855,16 @@ const handleInviteSubmit = async () => {
   <div class="space-y-8">
     <!-- Header Actions -->
     <Teleport v-if="teleportReady" to="#header-actions">
-       <div class="flex items-center gap-3">
+       <div class="flex items-center gap-3 flex-wrap justify-end">
+          <Button
+            variant="outline"
+            class="h-10 border-gray-200 bg-white"
+            :disabled="loading"
+            @click="handleRefresh"
+          >
+            <RefreshCw class="w-4 h-4 mr-2" :class="{ 'animate-spin': loading }" />
+            刷新
+          </Button>
           <Button @click="exportCodes" variant="outline" class="h-10 bg-white border-gray-200">
             <Download class="mr-2 h-4 w-4" />
             导出
@@ -1018,7 +1045,7 @@ const handleInviteSubmit = async () => {
                         :disabled="syncingAccountEmail === code.accountEmail"
                         @click="handleSyncAccountByEmail(code.accountEmail)"
                       >
-                        <span class="truncate">{{ code.accountEmail }}</span>
+                        <span class="truncate" :class="isAccountBanned(code.accountEmail) ? 'text-red-600' : ''">{{ code.accountEmail }}</span>
                         <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': syncingAccountEmail === code.accountEmail }" />
                       </button>
                       <span
@@ -1158,7 +1185,7 @@ const handleInviteSubmit = async () => {
 	                        <div class="w-4 h-4 flex-shrink-0 rounded-full bg-white flex items-center justify-center text-[10px] text-gray-500 font-bold shadow-sm">
 	                          {{ code.accountEmail.charAt(0).toUpperCase() }}
 	                        </div>
-	                        <span class="text-xs text-gray-700 truncate">{{ code.accountEmail }}</span>
+	                        <span class="text-xs truncate" :class="isAccountBanned(code.accountEmail) ? 'text-red-600' : 'text-gray-700'">{{ code.accountEmail }}</span>
 	                        <span
 	                          v-if="accountDemotionMeta(code.accountEmail)"
 	                          class="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium flex-shrink-0"
@@ -1528,7 +1555,12 @@ const handleInviteSubmit = async () => {
               </div>
               <div class="flex justify-between items-center">
                  <span class="text-xs text-blue-600 font-semibold uppercase">Account</span>
-                 <span class="font-medium text-blue-900">{{ redeemTargetCode.accountEmail || '未指定' }}</span>
+                 <span
+                   class="font-medium"
+                   :class="isAccountBanned(redeemTargetCode.accountEmail) ? 'text-red-600' : 'text-blue-900'"
+                 >
+                   {{ redeemTargetCode.accountEmail || '未指定' }}
+                 </span>
               </div>
            </div>
 

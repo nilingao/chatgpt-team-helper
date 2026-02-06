@@ -515,6 +515,14 @@ const loadAccounts = async () => {
   }
 }
 
+const handleRefresh = () => {
+  if (searchDebounceTimer) {
+    clearTimeout(searchDebounceTimer)
+    searchDebounceTimer = null
+  }
+  loadAccounts()
+}
+
 // 搜索处理
 const handleSearch = () => {
   paginationMeta.value.page = 1
@@ -918,13 +926,24 @@ const handleInviteSubmit = async () => {
   <div class="space-y-8">
     <!-- Header Actions -->
     <Teleport v-if="teleportReady" to="#header-actions">
-      <Button
-        @click="showDialog = true"
-        class="bg-black hover:bg-gray-800 text-white rounded-xl px-5 h-10 shadow-lg shadow-black/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
-      >
-        <Plus class="w-4 h-4 mr-2" />
-        新建账号
-      </Button>
+      <div class="flex items-center gap-3 flex-wrap justify-end">
+        <Button
+          variant="outline"
+          class="bg-white border-gray-200 text-gray-700 hover:bg-gray-50 h-10 rounded-xl px-4"
+          :disabled="loading"
+          @click="handleRefresh"
+        >
+          <RefreshCw class="w-4 h-4 mr-2" :class="loading ? 'animate-spin' : ''" />
+          刷新
+        </Button>
+        <Button
+          @click="showDialog = true"
+          class="bg-black hover:bg-gray-800 text-white rounded-xl px-5 h-10 shadow-lg shadow-black/10 transition-all hover:scale-[1.02] active:scale-[0.98]"
+        >
+          <Plus class="w-4 h-4 mr-2" />
+          新建账号
+        </Button>
+      </div>
     </Teleport>
 
     <!-- 筛选控制栏 -->

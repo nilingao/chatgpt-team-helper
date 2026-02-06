@@ -50,7 +50,8 @@ const accounts = ref<AccountRecoveryBannedAccountSummary[]>([])
 const accountsLoading = ref(false)
 const accountsError = ref('')
 const accountsSearch = ref('')
-const accountsPagination = ref({ page: 1, pageSize: 5, total: 0 })
+const accountsFilter = ref<'all' | 'pending'>('all')
+const accountsPagination = ref({ page: 1, pageSize: 8, total: 0 })
 
 const selectedAccountId = ref<number | null>(null)
 const selectedAccountEmail = ref('')
@@ -121,10 +122,11 @@ const stateClass = (state: string) => {
 	      pageSize: accountsPagination.value.pageSize,
 	      search: accountsSearch.value.trim() || undefined,
 	      days: daysNumber.value,
+	      pendingOnly: accountsFilter.value === 'pending' ? true : undefined,
 	    })
 	    const nextAccounts = response.accounts || []
 	    accounts.value = nextAccounts
-	    accountsPagination.value = response.pagination || { page: 1, pageSize: 5, total: 0 }
+	    accountsPagination.value = response.pagination || { page: 1, pageSize: accountsPagination.value.pageSize, total: 0 }
 
 	    const currentSelectedId = selectedAccountId.value
 	    if (currentSelectedId != null) {
@@ -207,6 +209,11 @@ const goToAccountsPage = (page: number) => {
   accountsPagination.value.page = page
   loadAccounts()
 }
+
+watch(accountsFilter, () => {
+  accountsPagination.value.page = 1
+  loadAccounts()
+})
 
 const handleRedeemsSearch = () => {
   redeemsPagination.value.page = 1
@@ -421,14 +428,26 @@ const reloadAll = async () => {
               <p class="text-xs text-gray-500 mt-1">近 {{ daysNumber }} 天存在影响记录</p>
             </div>
           </div>
-          <div class="mt-4 relative group">
-            <Search class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-blue-500 h-4 w-4 transition-colors" />
-            <Input
-              v-model.trim="accountsSearch"
-              placeholder="搜索账号邮箱…"
-              class="pl-9 h-11 bg-white border-transparent shadow-[0_2px_10px_rgba(0,0,0,0.03)] rounded-xl"
-              @keyup.enter="handleAccountsSearch"
-            />
+          <div class="mt-4 flex flex-col sm:flex-row gap-3">
+            <div class="relative group w-full">
+              <Search class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-blue-500 h-4 w-4 transition-colors" />
+              <Input
+                v-model.trim="accountsSearch"
+                placeholder="搜索账号邮箱…"
+                class="pl-9 h-11 bg-white border-transparent shadow-[0_2px_10px_rgba(0,0,0,0.03)] rounded-xl"
+                @keyup.enter="handleAccountsSearch"
+              />
+            </div>
+
+            <Select v-model="accountsFilter">
+              <SelectTrigger class="h-11 w-full sm:w-[160px] bg-white border-transparent shadow-[0_2px_10px_rgba(0,0,0,0.03)] rounded-xl">
+                <SelectValue placeholder="筛选" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部账号</SelectItem>
+                <SelectItem value="pending">仍有待处理</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         </div>
 

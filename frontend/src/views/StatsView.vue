@@ -19,7 +19,7 @@ const error = ref('')
 const overview = ref<AdminStatsOverviewResponse | null>(null)
 
 type RangePreset = 'today' | '7d' | '30d' | 'custom'
-const rangePreset = ref<RangePreset>('7d')
+const rangePreset = ref<RangePreset>('today')
 const rangeFrom = ref('')
 const rangeTo = ref('')
 const applyingPreset = ref(false)
@@ -63,7 +63,7 @@ watch([rangeFrom, rangeTo], () => {
   if (rangePreset.value !== 'custom') {
     rangePreset.value = 'custom'
   }
-})
+}, { flush: 'sync' })
 
 const locale = computed(() => appConfigStore.locale || 'zh-CN')
 const numberFmt = computed(() => new Intl.NumberFormat(locale.value))
@@ -143,12 +143,12 @@ onMounted(async () => {
 <template>
   <div class="space-y-8">
     <Teleport v-if="teleportReady" to="#header-actions">
-      <div class="flex flex-col sm:flex-row sm:items-end gap-3">
-        <div class="flex items-end gap-2">
-          <div class="space-y-1">
+      <div class="w-full flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-end">
+        <div class="grid grid-cols-2 gap-3 w-full sm:w-auto sm:flex sm:items-end sm:gap-2">
+          <div class="space-y-1 col-span-2 sm:col-span-1">
             <Label class="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">范围</Label>
             <Select v-model="rangePreset">
-              <SelectTrigger class="h-10 w-[120px] bg-white border-gray-200 rounded-xl">
+              <SelectTrigger class="h-10 w-full sm:w-[120px] bg-white border-gray-200 rounded-xl">
                 <SelectValue placeholder="选择范围" />
               </SelectTrigger>
               <SelectContent>
@@ -162,18 +162,18 @@ onMounted(async () => {
 
           <div class="space-y-1">
             <Label class="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">开始</Label>
-            <Input v-model="rangeFrom" type="date" class="h-10 bg-white border-gray-200 rounded-xl" />
+            <Input v-model="rangeFrom" type="date" class="h-10 w-full bg-white border-gray-200 rounded-xl sm:w-[160px]" />
           </div>
 
           <div class="space-y-1">
             <Label class="text-[11px] font-semibold text-gray-500 uppercase tracking-wider">结束</Label>
-            <Input v-model="rangeTo" type="date" class="h-10 bg-white border-gray-200 rounded-xl" />
+            <Input v-model="rangeTo" type="date" class="h-10 w-full bg-white border-gray-200 rounded-xl sm:w-[160px]" />
           </div>
         </div>
 
         <Button
           variant="outline"
-          class="h-10 rounded-xl border-gray-200 bg-white"
+          class="h-10 w-full rounded-xl border-gray-200 bg-white sm:w-auto"
           :disabled="loading"
           @click="loadOverview"
         >

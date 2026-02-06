@@ -164,7 +164,7 @@ router.get('/overview', async (req, res) => {
       `
         SELECT COUNT(*)
         FROM xhs_orders
-        WHERE DATE(created_at) = DATE('now', 'localtime')
+        WHERE DATE(REPLACE(COALESCE(NULLIF(TRIM(order_time), ''), created_at), '/', '-')) = DATE('now', 'localtime')
       `
     )
 	    const xhsOrdersTodayUsed = scalar(
@@ -172,7 +172,7 @@ router.get('/overview', async (req, res) => {
 	        SELECT COUNT(*)
 	        FROM xhs_orders
 	        WHERE COALESCE(is_used, 0) = 1
-	          AND DATE(created_at) = DATE('now', 'localtime')
+	          AND DATE(REPLACE(COALESCE(NULLIF(TRIM(order_time), ''), created_at), '/', '-')) = DATE('now', 'localtime')
 	      `
 	    )
 	    const xhsOrdersTodayPending = Math.max(0, xhsOrdersTodayTotal - xhsOrdersTodayUsed)
@@ -181,7 +181,7 @@ router.get('/overview', async (req, res) => {
 	        SELECT COALESCE(SUM(COALESCE(actual_paid, 0)), 0)
 	        FROM xhs_orders
 	        WHERE COALESCE(order_status, '') != '已关闭'
-	          AND DATE(created_at) BETWEEN DATE(?) AND DATE(?)
+	          AND DATE(REPLACE(COALESCE(NULLIF(TRIM(order_time), ''), created_at), '/', '-')) BETWEEN DATE(?) AND DATE(?)
 	      `,
 	      [from, to]
 	    )
@@ -190,7 +190,7 @@ router.get('/overview', async (req, res) => {
 	        SELECT COALESCE(SUM(COALESCE(actual_paid, 0)), 0)
 	        FROM xhs_orders
 	        WHERE COALESCE(order_status, '') != '已关闭'
-	          AND DATE(created_at) = DATE('now', 'localtime')
+	          AND DATE(REPLACE(COALESCE(NULLIF(TRIM(order_time), ''), created_at), '/', '-')) = DATE('now', 'localtime')
 	      `
 	    )
 

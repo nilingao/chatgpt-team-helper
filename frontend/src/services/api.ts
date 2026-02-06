@@ -677,6 +677,13 @@ export interface CreditAdminOrdersResponse {
   }
 }
 
+export interface CreditAdminOrdersSummaryResponse {
+  total: number
+  paid: number
+  pending: number
+  refunded: number
+}
+
 export interface CreditAdminBalanceResponse {
   paidTotal: string
   refundedTotal: string
@@ -1144,6 +1151,7 @@ export interface AccountRecoveryBannedAccountsListParams {
   pageSize?: number
   search?: string
   days?: number
+  pendingOnly?: boolean
 }
 
 export interface AccountRecoveryBannedAccountSummary {
@@ -1579,6 +1587,11 @@ export const creditService = {
 
   async adminListOrders(params?: CreditAdminOrdersParams): Promise<CreditAdminOrdersResponse> {
     const response = await api.get('/credit/admin/orders', { params })
+    return response.data
+  },
+
+  async adminGetOrdersSummary(params?: { search?: string }): Promise<CreditAdminOrdersSummaryResponse> {
+    const response = await api.get('/credit/admin/orders/summary', { params })
     return response.data
   },
 

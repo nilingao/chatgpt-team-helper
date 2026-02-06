@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import { authService, userService, adminService, versionService } from '@/services/api'
 import type { VersionInfo, LatestVersionInfo } from '@/services/api'
 import { useAppConfigStore } from '@/stores/appConfig'
@@ -28,6 +28,8 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Eye, EyeOff, Sparkles, KeyRound, AlertCircle, CheckCircle2, RefreshCw } from 'lucide-vue-next'
+
+const teleportReady = ref(false)
 
 // 版本检查相关
 const versionLoading = ref(false)
@@ -186,6 +188,9 @@ const telegramLoading = ref(false)
 const showTelegramBotToken = ref(false)
 
 onMounted(async () => {
+  await nextTick()
+  teleportReady.value = !!document.getElementById('header-actions')
+
   if (!isSuperAdmin.value) return
   await loadApiKey()
   await Promise.all([
@@ -199,6 +204,10 @@ onMounted(async () => {
     loadTurnstileSettings(),
     loadTelegramSettings(),
   ])
+})
+
+onUnmounted(() => {
+  teleportReady.value = false
 })
 
 const loadApiKey = async () => {
@@ -836,19 +845,19 @@ const savePointsWithdrawSettings = async () => {
 
 <template>
   <div class="space-y-8">
-    <!-- 页面头部：检查更新按钮 -->
-    <div v-if="isSuperAdmin" class="flex justify-end">
+    <!-- Header Actions -->
+    <Teleport v-if="teleportReady && isSuperAdmin" to="#header-actions">
       <Button
         variant="outline"
         :disabled="versionLoading"
-        class="h-10 px-4 border-gray-200 hover:bg-blue-50 hover:text-blue-600 hover:border-blue-200 rounded-xl transition-all"
+        class="h-10 px-4 border-gray-200 bg-white hover:bg-blue-50 hover:text-blue-600 hover:border-blue-200 rounded-xl transition-all"
         @click="checkForUpdates"
       >
         <RefreshCw v-if="versionLoading" class="w-4 h-4 mr-2 animate-spin" />
         <RefreshCw v-else class="w-4 h-4 mr-2" />
         检查更新
       </Button>
-    </div>
+    </Teleport>
 
     <!-- 版本检查对话框 -->
     <Dialog v-model:open="versionDialogOpen">

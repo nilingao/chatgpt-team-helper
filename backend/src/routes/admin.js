@@ -1775,182 +1775,206 @@ router.delete('/rbac/users/:id', async (req, res) => {
   }
 })
 
-// 封号账号补录管理
-router.get('/account-recovery/banned-accounts', async (req, res) => {
-  try {
-    const page = Math.max(1, Number(req.query.page) || 1)
-    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
-    const search = String(req.query.search || '').trim().toLowerCase()
-    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
-    const threshold = `-${days} days`
+	// 封号账号补录管理
+	router.get('/account-recovery/banned-accounts', async (req, res) => {
+	  try {
+	    const page = Math.max(1, Number(req.query.page) || 1)
+	    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 10))
+	    const search = String(req.query.search || '').trim().toLowerCase()
+	    const days = Math.max(1, Math.min(90, toInt(req.query.days, ACCOUNT_RECOVERY_WINDOW_DAYS)))
+	    const threshold = `-${days} days`
 
-    const db = await getDatabase()
+	    const db = await getDatabase()
+	    const pendingOnly = parseBool(req.query.pendingOnly, false)
 
-    // Always show banned accounts (unprocessed), even when no eligible codes exist in the window.
-    const accountConditions = [
-      'ga.is_banned = 1',
-      'COALESCE(ga.ban_processed, 0) = 0',
-    ]
-    const countParams = []
+	    // Always show banned accounts (unprocessed), even when no eligible codes exist in the window.
+	    const accountConditions = [
+	      'ga.is_banned = 1',
+	      'COALESCE(ga.ban_processed, 0) = 0',
+	    ]
+	    const accountParams = []
 
-    if (search) {
-      accountConditions.push('LOWER(ga.email) LIKE ?')
-      countParams.push(`%${search}%`)
-    }
+	    if (search) {
+	      accountConditions.push('LOWER(ga.email) LIKE ?')
+	      accountParams.push(`%${search}%`)
+	    }
 
-    const whereAccounts = accountConditions.length ? `WHERE ${accountConditions.join(' AND ')}` : ''
+	    const whereAccounts = accountConditions.length ? `WHERE ${accountConditions.join(' AND ')}` : ''
+	    const dataConditions = pendingOnly
+	      ? [...accountConditions, '(COALESCE(ea.pending_count, 0) + COALESCE(ea.failed_count, 0)) > 0']
+	      : accountConditions
+	    const whereAccountsFiltered = dataConditions.length ? `WHERE ${dataConditions.join(' AND ')}` : ''
 
-    const countResult = db.exec(
-      `
-        SELECT COUNT(*)
-        FROM gpt_accounts ga
-        ${whereAccounts}
-      `,
-      countParams
-    )
-    const total = Number(countResult[0]?.values?.[0]?.[0] || 0)
-    const offset = (page - 1) * pageSize
+	    const bannedAccountsEligibilitySql = `
+	      WITH log_flags AS (
+	        SELECT
+	          original_code_id,
+	          COUNT(*) AS attempts,
+	          MAX(id) AS latest_id
+	        FROM account_recovery_logs
+	        GROUP BY original_code_id
+	      ),
+	      log_latest AS (
+	        SELECT
+	          ar.original_code_id,
+	          ar.status
+	        FROM account_recovery_logs ar
+	        JOIN log_flags lf ON lf.latest_id = ar.id
+	      ),
+	      completed_flags AS (
+	        SELECT
+	          original_code_id,
+	          MAX(id) AS latest_completed_id
+	        FROM account_recovery_logs
+	        WHERE status IN ('success', 'skipped')
+	        GROUP BY original_code_id
+	      ),
+	      completed_latest AS (
+	        SELECT
+	          ar.original_code_id,
+	          ar.recovery_account_email
+	        FROM account_recovery_logs ar
+	        JOIN completed_flags cf ON cf.latest_completed_id = ar.id
+	      ),
+	      eligible_codes AS (
+	        SELECT
+	          ga.id AS account_id,
+	          rc.id AS original_code_id,
+	          rc.redeemed_at AS redeemed_at,
+	          rc.account_email AS original_account_email
+	        FROM gpt_accounts ga
+	        JOIN redemption_codes rc ON lower(rc.account_email) = lower(ga.email)
+	        WHERE ga.is_banned = 1
+	          AND rc.is_redeemed = 1
+	          AND rc.redeemed_at IS NOT NULL
+	          AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
+	          AND (
+	            EXISTS (
+	              SELECT 1
+	              FROM purchase_orders po
+	              WHERE (po.code_id = rc.id OR (po.code_id IS NULL AND po.code = rc.code))
+	                AND po.created_at >= DATETIME('now', 'localtime', ?)
+	                AND po.refunded_at IS NULL
+	                AND COALESCE(po.status, '') != 'refunded'
+	            )
+	            OR EXISTS (
+	              SELECT 1
+	              FROM credit_orders co
+	              WHERE (co.code_id = rc.id OR (co.code_id IS NULL AND co.code = rc.code))
+	                AND co.created_at >= DATETIME('now', 'localtime', ?)
+	                AND co.refunded_at IS NULL
+	                AND COALESCE(co.status, '') != 'refunded'
+	            )
+	            OR EXISTS (
+	              SELECT 1
+	              FROM xhs_orders xo
+	              WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+	                AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+	            )
+	            OR EXISTS (
+	              SELECT 1
+	              FROM xianyu_orders xo
+	              WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
+	                AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
+	            )
+	          )
+	          AND COALESCE(
+	            NULLIF((
+	              SELECT po2.order_type
+	              FROM purchase_orders po2
+	              WHERE (po2.code_id = rc.id OR (po2.code_id IS NULL AND po2.code = rc.code))
+	              ORDER BY po2.created_at DESC
+	              LIMIT 1
+	            ), ''),
+	            NULLIF(rc.order_type, ''),
+	            'warranty'
+	          ) != 'no_warranty'
+	      ),
+	      eligible_enriched AS (
+	        SELECT
+	          ec.account_id,
+	          ec.original_code_id,
+	          ec.redeemed_at,
+	          COALESCE(lf.attempts, 0) AS attempts,
+	          ll.status AS latest_status,
+	          COALESCE(cl.recovery_account_email, ec.original_account_email) AS current_account_email
+	        FROM eligible_codes ec
+	        LEFT JOIN log_flags lf ON lf.original_code_id = ec.original_code_id
+	        LEFT JOIN log_latest ll ON ll.original_code_id = ec.original_code_id
+	        LEFT JOIN completed_latest cl ON cl.original_code_id = ec.original_code_id
+	      ),
+	      eligible_with_current AS (
+	        SELECT
+	          ee.account_id,
+	          ee.original_code_id,
+	          ee.redeemed_at,
+	          ee.attempts,
+	          ee.latest_status,
+	          CASE
+	            WHEN current_ga.id IS NULL THEN 1
+	            ELSE COALESCE(current_ga.is_banned, 0)
+	          END AS current_is_banned
+	        FROM eligible_enriched ee
+	        LEFT JOIN gpt_accounts current_ga ON lower(current_ga.email) = lower(ee.current_account_email)
+	      ),
+	      eligible_agg AS (
+	        SELECT
+	          account_id,
+	          COUNT(original_code_id) AS impacted_total,
+	          SUM(CASE WHEN current_is_banned = 0 THEN 1 ELSE 0 END) AS done_count,
+	          SUM(CASE WHEN current_is_banned = 1 AND latest_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+	          SUM(CASE WHEN current_is_banned = 1 AND (latest_status IS NULL OR latest_status != 'failed') THEN 1 ELSE 0 END) AS pending_count,
+	          MAX(redeemed_at) AS latest_redeemed_at
+	        FROM eligible_with_current
+	        GROUP BY account_id
+	      )
+	    `.trim()
+
+	    let total = 0
+	    if (pendingOnly) {
+	      const countResult = db.exec(
+	        `
+	          ${bannedAccountsEligibilitySql}
+	          SELECT COUNT(*)
+	          FROM gpt_accounts ga
+	          LEFT JOIN eligible_agg ea ON ea.account_id = ga.id
+	          ${whereAccountsFiltered}
+	        `,
+	        [threshold, threshold, threshold, threshold, threshold, ...accountParams]
+	      )
+	      total = Number(countResult[0]?.values?.[0]?.[0] || 0)
+	    } else {
+	      const countResult = db.exec(
+	        `
+	          SELECT COUNT(*)
+	          FROM gpt_accounts ga
+	          ${whereAccounts}
+	        `,
+	        accountParams
+	      )
+	      total = Number(countResult[0]?.values?.[0]?.[0] || 0)
+	    }
+	    const offset = (page - 1) * pageSize
 
 	    const dataResult = db.exec(
 	      `
-	        WITH log_flags AS (
-	          SELECT
-	            original_code_id,
-	            COUNT(*) AS attempts,
-	            MAX(id) AS latest_id
-	          FROM account_recovery_logs
-	          GROUP BY original_code_id
-	        ),
-	        log_latest AS (
-	          SELECT
-	            ar.original_code_id,
-	            ar.status
-	          FROM account_recovery_logs ar
-	          JOIN log_flags lf ON lf.latest_id = ar.id
-	        ),
-	        completed_flags AS (
-	          SELECT
-	            original_code_id,
-	            MAX(id) AS latest_completed_id
-	          FROM account_recovery_logs
-	          WHERE status IN ('success', 'skipped')
-	          GROUP BY original_code_id
-	        ),
-	        completed_latest AS (
-	          SELECT
-	            ar.original_code_id,
-	            ar.recovery_account_email
-	          FROM account_recovery_logs ar
-	          JOIN completed_flags cf ON cf.latest_completed_id = ar.id
-	        ),
-	        eligible_codes AS (
-	          SELECT
-	            ga.id AS account_id,
-	            rc.id AS original_code_id,
-	            rc.redeemed_at AS redeemed_at,
-	            rc.account_email AS original_account_email
-	          FROM gpt_accounts ga
-	          JOIN redemption_codes rc ON lower(rc.account_email) = lower(ga.email)
-	          WHERE ga.is_banned = 1
-	            AND rc.is_redeemed = 1
-            AND rc.redeemed_at IS NOT NULL
-            AND rc.redeemed_at >= DATETIME('now', 'localtime', ?)
-	            AND (
-	              EXISTS (
-	                SELECT 1
-	                FROM purchase_orders po
-	                WHERE (po.code_id = rc.id OR (po.code_id IS NULL AND po.code = rc.code))
-	                  AND po.created_at >= DATETIME('now', 'localtime', ?)
-	                  AND po.refunded_at IS NULL
-	                  AND COALESCE(po.status, '') != 'refunded'
-	              )
-	              OR EXISTS (
-	                SELECT 1
-	                FROM credit_orders co
-	                WHERE (co.code_id = rc.id OR (co.code_id IS NULL AND co.code = rc.code))
-	                  AND co.created_at >= DATETIME('now', 'localtime', ?)
-	                  AND co.refunded_at IS NULL
-	                  AND COALESCE(co.status, '') != 'refunded'
-	              )
-	              OR EXISTS (
-	                SELECT 1
-	                FROM xhs_orders xo
-                WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
-                  AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
-              )
-              OR EXISTS (
-                SELECT 1
-                FROM xianyu_orders xo
-                WHERE (xo.assigned_code_id = rc.id OR (xo.assigned_code_id IS NULL AND xo.assigned_code = rc.code))
-                  AND COALESCE(xo.order_time, xo.created_at) >= DATETIME('now', 'localtime', ?)
-              )
-            )
-            AND COALESCE(
-              NULLIF((
-                SELECT po2.order_type
-                FROM purchase_orders po2
-                WHERE (po2.code_id = rc.id OR (po2.code_id IS NULL AND po2.code = rc.code))
-                ORDER BY po2.created_at DESC
-                LIMIT 1
-              ), ''),
-              NULLIF(rc.order_type, ''),
-	              'warranty'
-	            ) != 'no_warranty'
-	        ),
-	        eligible_enriched AS (
-	          SELECT
-	            ec.account_id,
-	            ec.original_code_id,
-	            ec.redeemed_at,
-	            COALESCE(lf.attempts, 0) AS attempts,
-	            ll.status AS latest_status,
-	            COALESCE(cl.recovery_account_email, ec.original_account_email) AS current_account_email
-	          FROM eligible_codes ec
-	          LEFT JOIN log_flags lf ON lf.original_code_id = ec.original_code_id
-	          LEFT JOIN log_latest ll ON ll.original_code_id = ec.original_code_id
-	          LEFT JOIN completed_latest cl ON cl.original_code_id = ec.original_code_id
-	        ),
-	        eligible_with_current AS (
-	          SELECT
-	            ee.account_id,
-	            ee.original_code_id,
-	            ee.redeemed_at,
-	            ee.attempts,
-	            ee.latest_status,
-	            CASE
-	              WHEN current_ga.id IS NULL THEN 1
-	              ELSE COALESCE(current_ga.is_banned, 0)
-	            END AS current_is_banned
-	          FROM eligible_enriched ee
-	          LEFT JOIN gpt_accounts current_ga ON lower(current_ga.email) = lower(ee.current_account_email)
-	        ),
-	        eligible_agg AS (
-	          SELECT
-	            account_id,
-	            COUNT(original_code_id) AS impacted_total,
-	            SUM(CASE WHEN current_is_banned = 0 THEN 1 ELSE 0 END) AS done_count,
-	            SUM(CASE WHEN current_is_banned = 1 AND latest_status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
-	            SUM(CASE WHEN current_is_banned = 1 AND (latest_status IS NULL OR latest_status != 'failed') THEN 1 ELSE 0 END) AS pending_count,
-	            MAX(redeemed_at) AS latest_redeemed_at
-	          FROM eligible_with_current
-	          GROUP BY account_id
-	        )
+	        ${bannedAccountsEligibilitySql}
 	        SELECT
 	          ga.id,
 	          ga.email,
-          COALESCE(ea.impacted_total, 0) AS impacted_total,
-          COALESCE(ea.done_count, 0) AS done_count,
-          COALESCE(ea.failed_count, 0) AS failed_count,
-          COALESCE(ea.pending_count, 0) AS pending_count,
-          ea.latest_redeemed_at
-        FROM gpt_accounts ga
-        LEFT JOIN eligible_agg ea ON ea.account_id = ga.id
-        ${whereAccounts}
-        ORDER BY latest_redeemed_at DESC
-        LIMIT ? OFFSET ?
-      `,
-      [threshold, threshold, threshold, threshold, threshold, ...countParams, pageSize, offset]
-    )
+	          COALESCE(ea.impacted_total, 0) AS impacted_total,
+	          COALESCE(ea.done_count, 0) AS done_count,
+	          COALESCE(ea.failed_count, 0) AS failed_count,
+	          COALESCE(ea.pending_count, 0) AS pending_count,
+	          ea.latest_redeemed_at
+	        FROM gpt_accounts ga
+	        LEFT JOIN eligible_agg ea ON ea.account_id = ga.id
+	        ${whereAccountsFiltered}
+	        ORDER BY latest_redeemed_at DESC
+	        LIMIT ? OFFSET ?
+	      `,
+	      [threshold, threshold, threshold, threshold, threshold, ...accountParams, pageSize, offset]
+	    )
 
     const accounts = (dataResult[0]?.values || []).map(row => ({
       id: Number(row[0]),
